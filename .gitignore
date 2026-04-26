@@ -20,10 +20,7 @@ venv/
 logs/
 *.log
 
-# ML artifacts
-data/model.pkl
-data/label_encoders.pkl
-airflow/data/*.pkl
+# ML artifacts — large trained models only (small fallback .pkl files are tracked)
 airflow/data/*.pkg
 
 # Docker volumes
