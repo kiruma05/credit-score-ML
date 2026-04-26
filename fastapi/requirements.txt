@@ -1,0 +1,22 @@
+# Core API Framework
+fastapi
+uvicorn[standard]
+
+# Database and ORM
+sqlalchemy
+psycopg2-binary
+
+# Data Science and ML
+scikit-learn==1.5.2
+pandas
+numpy
+mlflow==2.9.2
+pyspark==3.3.3
+
+# AWS / MinIO interaction
+boto3
+
+# Utility libraries
+requests
+pydantic
+python-dotenv

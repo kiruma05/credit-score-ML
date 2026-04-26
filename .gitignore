@@ -1,0 +1,31 @@
+# IDE
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.env
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# OS
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# ML artifacts
+data/model.pkl
+data/label_encoders.pkl
+airflow/data/*.pkl
+airflow/data/*.pkg
+
+# Docker volumes
+pgdata/
+minio_data/

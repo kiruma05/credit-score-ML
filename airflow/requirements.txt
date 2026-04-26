@@ -1,0 +1,9 @@
+astapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+pydantic
+mlflow==2.9.2
+pyspark==3.3.3
+pandas
+boto3

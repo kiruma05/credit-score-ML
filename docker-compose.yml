@@ -1,0 +1,331 @@
+version: '3.8'
+
+x-spark-common: &spark-common
+  build:
+    context: ./spark
+    dockerfile: Dockerfile
+  volumes:
+    - ./spark/training:/opt/bitnami/spark/jobs
+    - ./data:/opt/bitnami/spark/data
+  networks:
+    - credit-net
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  env_file:
+    - .env
+  environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres:5432/${AIRFLOW_DB_NAME}
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__WEBSERVER__BASE_URL=http://localhost:8087
+      - MLFLOW_TRACKING_URI=http://mlflow-server:5000  # Use the service name and internal port
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+  volumes:
+    - ./data:/opt/bitnami/spark/data
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/jobs:/opt/bitnami/spark/jobs
+    - ./logs:/opt/airflow/logs
+    - ./airflow/jobs:/opt/airflow/jobs
+    - ./data:/opt/airflow/data
+  depends_on:
+    postgres:
+        condition: service_healthy
+  networks:
+    - credit-net
+
+services:
+  mlflow-server-score:
+    build: { context: ./mlflow }
+    container_name: mlflow-server-score
+    command: >
+      mlflow models serve -m "models:/CreditScorePredictor/Production" --host 0.0.0.0 --port 8001 --no-conda
+    # No ports exposed to host, it's an internal service
+    ports:
+      - "8001:8001"
+    env_file: [ .env ]
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow-server:5000
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    depends_on: { mlflow-server: { condition: service_started } }
+    networks:
+      - credit-net
+
+  mlflow-server-risk:
+    build: { context: ./mlflow }
+    container_name: mlflow-server-risk
+    command: >
+      mlflow models serve -m "models:/RiskCategoryPredictor/Production" --host 0.0.0.0 --port 8002 --no-conda
+    ports:
+      - "8002:8002"
+    env_file: [ .env ]
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow-server:5000
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    depends_on: { mlflow-server: { condition: service_started } }
+    networks: [ credit-net ]
+
+  mlflow-server-limit:
+      build: { context: ./mlflow }
+      container_name: mlflow-server-limit
+      command: >
+        mlflow models serve -m "models:/CreditLimitPredictor/Production" --host 0.0.0.0 --port 8003 --no-conda
+      ports:
+        - "8003:8003"
+      env_file: [ .env ]
+      environment:
+        - MLFLOW_TRACKING_URI=http://mlflow-server:5000
+        - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+        - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+        - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      depends_on: { mlflow-server: { condition: service_started } }
+      networks: [ credit-net ]
+
+   #new service
+  mlflow-server-fraud:
+    build: { context: ./mlflow }
+    container_name: mlflow-server-fraud
+    command: >
+      mlflow models serve -m "models:/FraudDetector/Production" --host 0.0.0.0 --port 8004 --no-conda
+    ports:
+      - "8004:8004"
+    env_file: [ .env ]
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow-server:5000
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    depends_on:
+      mlflow-server:
+        condition: service_started
+    networks: [ credit-net ]
+   
+
+  spark-master:
+    <<: *spark-common
+    container_name: spark-master
+    command: bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "9080:8080"
+      - "7077:7077"
+    environment:
+      - PYSPARK_PYTHON=/opt/bitnami/python/bin/python
+      - PYSPARK_DRIVER_PYTHON=/opt/bitnami/python/bin/python
+
+  spark-worker:
+    <<: *spark-common
+    container_name: spark-worker
+    command: bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_WORKER_CORES=8
+      - SPARK_WORKER_MEMORY=12g
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - PYSPARK_PYTHON=/opt/bitnami/python/bin/python
+
+  spark-worker2:
+    <<: *spark-common
+    container_name: spark-worker2
+    command: bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_WORKER_CORES=3
+      - SPARK_WORKER_MEMORY=4g
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - PYSPARK_PYTHON=/opt/bitnami/python/bin/python
+
+  postgres:
+    image: postgres:14.0
+    container_name: postgres-db
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      # Variables for the init script to use
+      - AIRFLOW_DB_USER=${AIRFLOW_DB_USER}
+      - AIRFLOW_DB_PASSWORD=${AIRFLOW_DB_PASSWORD}
+      - AIRFLOW_DB_NAME=${AIRFLOW_DB_NAME}
+      - MLFLOW_DB_USER=${MLFLOW_DB_USER}
+      - MLFLOW_DB_PASSWORD=${MLFLOW_DB_PASSWORD}
+      - MLFLOW_DB_NAME=${MLFLOW_DB_NAME}
+    ports:
+      - "5432:5432"
+    networks:
+      - credit-net
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - ./scripts/:/docker-entrypoint-initdb.d/
+      - pgdata:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:RELEASE.2023-09-07T02-05-02Z # Using a specific stable tag
+    container_name: minio-storage
+    ports:
+      - "9000:9000" # S3 API Port
+      - "9001:9001" # MinIO Console UI Port
+    command: server /data --console-address ':9001' --address ':9000'
+    env_file:
+      - .env
+    environment:
+      - MINIO_ROOT_USER=${AWS_ACCESS_KEY_ID}
+      - MINIO_ROOT_PASSWORD=${AWS_SECRET_ACCESS_KEY}
+    volumes:
+      - minio_data:/data
+    networks:
+      - credit-net
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mc-create-bucket:
+      image: minio/mc
+      depends_on:
+        minio:
+          condition: service_healthy
+      container_name: mc-initializer
+      env_file:
+        - .env
+      entrypoint: >
+        /bin/sh -c "
+        /usr/bin/mc alias set minio http://minio:9000 ${AWS_ACCESS_KEY_ID} ${AWS_SECRET_ACCESS_KEY};
+        /usr/bin/mc mb minio/mlflow --ignore-existing;
+        exit 0;
+        "
+      networks:
+        - credit-net
+
+
+  webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8087:8080"
+    depends_on:
+      - scheduler
+
+  scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command:  >
+      bash -c "airflow db migrate && 
+               airflow users create --username ${AIRFLOW_USER} --password ${AIRFLOW_PASSWORD} --firstname Spark --lastname User --role Admin --email admin@example.com &&
+               airflow scheduler"
+    restart: on-failure
+
+  # --- MLFLOW SERVER (CRITICAL CHANGES) ---
+  mlflow-server:
+    build:
+        context: ./mlflow
+        dockerfile: Dockerfile
+    container_name: mlflow-server
+    volumes:
+      - ./start-mlflow.sh:/scripts/start-mlflow.sh
+    command: /scripts/start-mlflow.sh
+    ports:
+      - "5000:5000" # Using 5001 to avoid conflicts
+      - "6060:6060" # For MLflow UI
+    # <<< ADDED ENVIRONMENT & DEPENDS_ON >>>
+    env_file:
+      - .env
+    environment:
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mc-create-bucket: # Wait for the bucket to be created
+        condition: service_completed_successfully
+    networks:
+      credit-net:
+        aliases:
+            - mlflow.local
+
+  fastapi-app:
+    build:
+      context: ./fastapi
+      dockerfile: Dockerfile
+    container_name: fastapi-app
+    env_file:
+      - .env
+    environment:
+      # ✅ Internal database (for FastAPI service)
+      - DATABASE_URL=postgresql+psycopg2://${MLFLOW_DB_USER}:${MLFLOW_DB_PASSWORD}@postgres:5432/${MLFLOW_DB_NAME}
+
+      # ✅ External — User/Auth DB (cms_uaa)
+      - EXTERNAL_DB_HOST=${EXTERNAL_DB_HOST}
+      - EXTERNAL_DB_PORT=${EXTERNAL_DB_PORT}
+      - EXTERNAL_DB_NAME=${EXTERNAL_DB_NAME}
+      - EXTERNAL_DB_USER=${EXTERNAL_DB_USER}
+      - EXTERNAL_DB_PASSWORD=${EXTERNAL_DB_PASSWORD}
+
+      # ✅ External — Origination DB (cms_origination)
+      - ORIGINATION_DB_HOST=${ORIGINATION_DB_HOST}
+      - ORIGINATION_DB_PORT=${ORIGINATION_DB_PORT}
+      - ORIGINATION_DB_NAME=${ORIGINATION_DB_NAME}
+      - ORIGINATION_DB_USER=${ORIGINATION_DB_USER}
+      - ORIGINATION_DB_PASSWORD=${ORIGINATION_DB_PASSWORD}
+
+      # ✅ MLflow / S3 Storage (MinIO)
+      - MLFLOW_TRACKING_URI=http://mlflow-server:5000
+      - MLFLOW_FRAUD_MODEL_URI=http://mlflow-server-fraud:8004
+      - MLFLOW_FRAUD_MODEL_URI=http://mlflow-server-fraud:8004
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+
+      # ✅ Extra configs
+      - FRAUD_MODEL_NAME=FraudDetector
+      - FRAUD_MODEL_VERSION=1
+      - ENCODER_PATH=/opt/airflow/data/label_encoders.pkl
+    ports:
+      - "8008:8000"
+    volumes:
+      - ./fastapi/app:/app/app          # ✅ correct code mapping
+      - ./data:/app/data
+      - ./data:/opt/airflow/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow-server:
+        condition: service_started
+      mlflow-server-score:
+        condition: service_started
+      mlflow-server-risk:
+        condition: service_started
+      mlflow-server-limit:
+        condition: service_started
+      mlflow-server-fraud:
+        condition: service_started
+    networks:
+      - credit-net
+
+
+#netwoks issues.......
+networks:
+  credit-net:
+
+volumes:
+  mlflow_artifacts:
+  logs:
+  minio_data:
+  pgdata:
