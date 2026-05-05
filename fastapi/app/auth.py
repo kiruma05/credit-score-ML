@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 ENFORCE_KEY_EXPIRY = os.getenv("ENFORCE_KEY_EXPIRY", "false").lower() == "true"
 REQUIRE_HTTPS = os.getenv("REQUIRE_HTTPS", "false").lower() == "true"
+DISABLE_AUTH = os.getenv("DISABLE_AUTH", "false").lower() == "true"
 
 
 def hash_secret(plain: str) -> str:
@@ -50,6 +51,11 @@ async def require_api_auth(
     api_secret: Optional[str] = Header(None, alias="api-secret"),
     db: Session = Depends(_get_auth_db),
 ) -> models.ApiClient:
+    # Dev mode: skip all auth checks — set DISABLE_AUTH=true in .env
+    if DISABLE_AUTH:
+        logger.warning("Auth disabled (DISABLE_AUTH=true) — dev mode only!")
+        return models.ApiClient(client_name="dev", api_key="dev", api_secret_hash="", is_active=True)
+
     # HTTPS enforcement (production only)
     if REQUIRE_HTTPS and request.url.scheme != "https":
         raise HTTPException(status_code=403, detail="HTTPS is required.")
