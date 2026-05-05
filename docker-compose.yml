@@ -269,17 +269,17 @@ services:
       - .env
     environment:
       # ✅ Internal database (for FastAPI service)
-      - DATABASE_URL=postgresql+psycopg2://${MLFLOW_DB_USER}:${MLFLOW_DB_PASSWORD}@postgres:5432/${MLFLOW_DB_NAME}
+     - DATABASE_URL=postgresql+psycopg2://${MLFLOW_DB_USER}:${MLFLOW_DB_PASSWORD}@postgres:5432/${MLFLOW_DB_NAME}
 
       # ✅ External — User/Auth DB (cms_uaa)
-      - EXTERNAL_DB_HOST=${EXTERNAL_DB_HOST}
+     - EXTERNAL_DB_HOST=${EXTERNAL_DB_HOST}
       - EXTERNAL_DB_PORT=${EXTERNAL_DB_PORT}
       - EXTERNAL_DB_NAME=${EXTERNAL_DB_NAME}
       - EXTERNAL_DB_USER=${EXTERNAL_DB_USER}
       - EXTERNAL_DB_PASSWORD=${EXTERNAL_DB_PASSWORD}
 
       # ✅ External — Origination DB (cms_origination)
-      - ORIGINATION_DB_HOST=${ORIGINATION_DB_HOST}
+     - ORIGINATION_DB_HOST=${ORIGINATION_DB_HOST}
       - ORIGINATION_DB_PORT=${ORIGINATION_DB_PORT}
       - ORIGINATION_DB_NAME=${ORIGINATION_DB_NAME}
       - ORIGINATION_DB_USER=${ORIGINATION_DB_USER}
@@ -287,7 +287,9 @@ services:
 
       # ✅ MLflow / S3 Storage (MinIO)
       - MLFLOW_TRACKING_URI=http://mlflow-server:5000
-      - MLFLOW_FRAUD_MODEL_URI=http://mlflow-server-fraud:8004
+      - MLFLOW_SCORE_MODEL_URI=http://mlflow-server-score:8001
+      - MLFLOW_RISK_MODEL_URI=http://mlflow-server-risk:8002
+      - MLFLOW_LIMIT_MODEL_URI=http://mlflow-server-limit:8003
       - MLFLOW_FRAUD_MODEL_URI=http://mlflow-server-fraud:8004
       - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
