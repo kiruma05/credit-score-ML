@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, Date, Numeric, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, DateTime, Date, Numeric, ForeignKey, Boolean
 from sqlalchemy.orm import relationship
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
@@ -69,6 +69,19 @@ class Repayment(Base):
     payment_date = Column(DateTime, default=datetime.utcnow)
 
     loan = relationship("Loan", back_populates="repayments")
+
+
+class ApiClient(Base):
+    __tablename__ = "api_clients"
+    id = Column(Integer, primary_key=True)
+    client_name = Column(String, unique=True, index=True, nullable=False)
+    api_key = Column(String, unique=True, index=True, nullable=False)
+    api_secret_hash = Column(String, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    expires_at = Column(DateTime, nullable=True)       # null = never expires (dev-safe)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_used_at = Column(DateTime, nullable=True)
+    scopes = Column(String, default="*")               # reserved for future scope-based auth
 
 
 # ==============================================================================

@@ -11,7 +11,7 @@ scikit-learn==1.5.2
 pandas
 numpy
 mlflow==2.9.2
-pyspark==3.3.3
+shap
 
 # AWS / MinIO interaction
 boto3
@@ -20,3 +20,6 @@ boto3
 requests
 pydantic
 python-dotenv
+
+# Security
+bcrypt

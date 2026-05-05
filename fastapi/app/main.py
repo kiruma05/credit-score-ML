@@ -5,6 +5,7 @@ import sys
 from datetime import datetime, date, timedelta
 from urllib.parse import quote_plus
 from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session, sessionmaker, joinedload
 from sqlalchemy import create_engine, text
 from pydantic import BaseModel
@@ -21,6 +22,9 @@ from app import models, services
 from app.database import SessionLocal, engine
 from app.fraud.fraud_model import load_model, load_label_encoders
 from app.fraud.fraud_router import router as fraud_router
+from app.auth import require_api_auth
+from app.auth_router import router as auth_router
+from app.explainer import load_model_for_shap, explain_prediction, summarize_drivers
 
 app = FastAPI(
     title="Credit Scoring & Fraud Detection API",
@@ -28,7 +32,23 @@ app = FastAPI(
     version="5.5.4",
 )
 
-app.include_router(fraud_router, prefix="/fraud", tags=["Fraud Detection"])
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(auth_router, prefix="/auth")
+app.include_router(
+    fraud_router,
+    prefix="/fraud",
+    tags=["Fraud Detection"],
+    dependencies=[Depends(require_api_auth)],
+)
 
 USD_TO_TZS_RATE = 1
 MLFLOW_CLIENT = None
@@ -312,6 +332,7 @@ def predict(
     local_db: Session = Depends(get_db),
     ext_db: Session = Depends(get_external_db),
     origination_db: Session = Depends(get_origination_db),
+    _auth: models.ApiClient = Depends(require_api_auth),
 ):
     """
     Run a credit assessment for a customer identified by NIDA.
@@ -395,8 +416,59 @@ def predict(
     )
 
 
+@app.post("/explain", tags=["Credit Scoring"])
+def explain(
+    request: models.PredictionRequest,
+    local_db: Session = Depends(get_db),
+    ext_db: Session = Depends(get_external_db),
+    origination_db: Session = Depends(get_origination_db),
+    _auth: models.ApiClient = Depends(require_api_auth),
+):
+    """
+    Run a credit assessment and return a full SHAP explanation of the score.
+    Shows which features drove the credit score up or down for this customer.
+    """
+    customer = find_or_create_customer(request.nida, local_db, ext_db)
+    features = _get_customer_features(customer, ext_db, origination_db)
+    inference = _build_credit_inference(features)
+    model_version = get_production_model_version("CreditScorePredictor")
+
+    # Load model from MLflow registry for SHAP (bypasses serving endpoint)
+    tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow-server:5000")
+    explanation_result = {"top_drivers": [], "base_score": None, "method": "unavailable"}
+    explanation_error = None
+
+    shap_model = load_model_for_shap("CreditScorePredictor", tracking_uri)
+    if shap_model is not None:
+        explanation_result = explain_prediction(shap_model, features, top_n=5)
+    else:
+        explanation_error = "Model registry unavailable — SHAP explanation skipped."
+
+    explanation_result["summary"] = summarize_drivers(explanation_result["top_drivers"])
+
+    return {
+        "customer_id": customer.customer_id,
+        "request_id": str(uuid.uuid4()),
+        "timestamp": datetime.utcnow().isoformat(),
+        "credit_score": inference["credit_score"],
+        "risk_category": inference["risk_category"],
+        "risk_probability": inference["risk_probability"],
+        "decision": inference["decision"],
+        "recommended_credit_limit": inference["recommended_credit_limit"],
+        "suggested_interest_rate": inference["suggested_interest_rate"],
+        "validity_period": f"{inference['validity_period_days']} days",
+        "model_version": model_version,
+        "explanation": explanation_result if not explanation_error else None,
+        "explanation_error": explanation_error,
+    }
+
+
 @app.get("/status/{customer_id}", response_model=models.StatusResponse, tags=["Credit Scoring"])
-def status(customer_id: str, local_db: Session = Depends(get_db)):
+def status(
+    customer_id: str,
+    local_db: Session = Depends(get_db),
+    _auth: models.ApiClient = Depends(require_api_auth),
+):
     """Return the current credit status and active loans for a customer."""
     customer = local_db.query(models.Customer).filter(
         models.Customer.customer_id == customer_id
@@ -461,7 +533,11 @@ def status(customer_id: str, local_db: Session = Depends(get_db)):
 # ─── Loan Management ──────────────────────────────────────────────────────────
 
 @app.post("/disburse", response_model=models.StatusResponse, tags=["Loan Management"])
-def disburse(request: models.DisburseRequest, local_db: Session = Depends(get_db)):
+def disburse(
+    request: models.DisburseRequest,
+    local_db: Session = Depends(get_db),
+    _auth: models.ApiClient = Depends(require_api_auth),
+):
     """Disburse a loan to an approved customer against their valid credit assessment."""
     customer = local_db.query(models.Customer).filter(
         models.Customer.customer_id == request.customer_id
@@ -532,7 +608,11 @@ def disburse(request: models.DisburseRequest, local_db: Session = Depends(get_db
 
 
 @app.post("/repay", response_model=models.StatusResponse, tags=["Loan Management"])
-def repay(request: models.RepayRequest, local_db: Session = Depends(get_db)):
+def repay(
+    request: models.RepayRequest,
+    local_db: Session = Depends(get_db),
+    _auth: models.ApiClient = Depends(require_api_auth),
+):
     """Record a repayment against an active loan."""
     loan = (
         local_db.query(models.Loan)
