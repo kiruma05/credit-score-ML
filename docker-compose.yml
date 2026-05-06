@@ -17,13 +17,13 @@ x-airflow-common: &airflow-common
   env_file:
     - .env
   environment:
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres:5432/${AIRFLOW_DB_NAME}
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__WEBSERVER__BASE_URL=http://localhost:8087
-      - MLFLOW_TRACKING_URI=http://mlflow-server:5000  # Use the service name and internal port
-      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres:5432/${AIRFLOW_DB_NAME}
+    - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+    - AIRFLOW__WEBSERVER__BASE_URL=http://localhost:8087
+    - MLFLOW_TRACKING_URI=http://mlflow-server:5000  # Use the service name and internal port
+    - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+    - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+    - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
   volumes:
     - ./data:/opt/bitnami/spark/data
     - ./airflow/dags:/opt/airflow/dags
@@ -33,7 +33,7 @@ x-airflow-common: &airflow-common
     - ./data:/opt/airflow/data
   depends_on:
     postgres:
-        condition: service_healthy
+      condition: service_healthy
   networks:
     - credit-net
 
@@ -73,22 +73,22 @@ services:
     networks: [ credit-net ]
 
   mlflow-server-limit:
-      build: { context: ./mlflow }
-      container_name: mlflow-server-limit
-      command: >
-        mlflow models serve -m "models:/CreditLimitPredictor/Production" --host 0.0.0.0 --port 8003 --no-conda
-      ports:
-        - "8003:8003"
-      env_file: [ .env ]
-      environment:
-        - MLFLOW_TRACKING_URI=http://mlflow-server:5000
-        - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
-        - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-        - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      depends_on: { mlflow-server: { condition: service_started } }
-      networks: [ credit-net ]
+    build: { context: ./mlflow }
+    container_name: mlflow-server-limit
+    command: >
+      mlflow models serve -m "models:/CreditLimitPredictor/Production" --host 0.0.0.0 --port 8003 --no-conda
+    ports:
+      - "8003:8003"
+    env_file: [ .env ]
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow-server:5000
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    depends_on: { mlflow-server: { condition: service_started } }
+    networks: [ credit-net ]
 
-   #new service
+  #new service
   mlflow-server-fraud:
     build: { context: ./mlflow }
     container_name: mlflow-server-fraud
@@ -196,21 +196,21 @@ services:
       retries: 5
 
   mc-create-bucket:
-      image: minio/mc
-      depends_on:
-        minio:
-          condition: service_healthy
-      container_name: mc-initializer
-      env_file:
-        - .env
-      entrypoint: >
-        /bin/sh -c "
-        /usr/bin/mc alias set minio http://minio:9000 ${AWS_ACCESS_KEY_ID} ${AWS_SECRET_ACCESS_KEY};
-        /usr/bin/mc mb minio/mlflow --ignore-existing;
-        exit 0;
-        "
-      networks:
-        - credit-net
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    container_name: mc-initializer
+    env_file:
+      - .env
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set minio http://minio:9000 ${AWS_ACCESS_KEY_ID} ${AWS_SECRET_ACCESS_KEY};
+      /usr/bin/mc mb minio/mlflow --ignore-existing;
+      exit 0;
+      "
+    networks:
+      - credit-net
 
 
   webserver:
@@ -234,8 +234,8 @@ services:
   # --- MLFLOW SERVER (CRITICAL CHANGES) ---
   mlflow-server:
     build:
-        context: ./mlflow
-        dockerfile: Dockerfile
+      context: ./mlflow
+      dockerfile: Dockerfile
     container_name: mlflow-server
     volumes:
       - ./start-mlflow.sh:/scripts/start-mlflow.sh
@@ -258,7 +258,7 @@ services:
     networks:
       credit-net:
         aliases:
-            - mlflow.local
+          - mlflow.local
 
   fastapi-app:
     build:
@@ -269,17 +269,17 @@ services:
       - .env
     environment:
       # ✅ Internal database (for FastAPI service)
-     - DATABASE_URL=postgresql+psycopg2://${MLFLOW_DB_USER}:${MLFLOW_DB_PASSWORD}@postgres:5432/${MLFLOW_DB_NAME}
+      - DATABASE_URL=postgresql+psycopg2://${MLFLOW_DB_USER}:${MLFLOW_DB_PASSWORD}@postgres:5432/${MLFLOW_DB_NAME}
 
       # ✅ External — User/Auth DB (cms_uaa)
-     - EXTERNAL_DB_HOST=${EXTERNAL_DB_HOST}
+      - EXTERNAL_DB_HOST=${EXTERNAL_DB_HOST}
       - EXTERNAL_DB_PORT=${EXTERNAL_DB_PORT}
       - EXTERNAL_DB_NAME=${EXTERNAL_DB_NAME}
       - EXTERNAL_DB_USER=${EXTERNAL_DB_USER}
       - EXTERNAL_DB_PASSWORD=${EXTERNAL_DB_PASSWORD}
 
       # ✅ External — Origination DB (cms_origination)
-     - ORIGINATION_DB_HOST=${ORIGINATION_DB_HOST}
+      - ORIGINATION_DB_HOST=${ORIGINATION_DB_HOST}
       - ORIGINATION_DB_PORT=${ORIGINATION_DB_PORT}
       - ORIGINATION_DB_NAME=${ORIGINATION_DB_NAME}
       - ORIGINATION_DB_USER=${ORIGINATION_DB_USER}
