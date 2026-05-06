@@ -19,7 +19,7 @@ x-airflow-common: &airflow-common
   environment:
     - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres:5432/${AIRFLOW_DB_NAME}
     - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-    - AIRFLOW__WEBSERVER__BASE_URL=http://localhost:8087
+    - AIRFLOW__WEBSERVER__BASE_URL=http://localhost:18087
     - MLFLOW_TRACKING_URI=http://mlflow-server:5000  # Use the service name and internal port
     - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
     - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
@@ -45,7 +45,7 @@ services:
       mlflow models serve -m "models:/CreditScorePredictor/Production" --host 0.0.0.0 --port 8001 --no-conda
     # No ports exposed to host, it's an internal service
     ports:
-      - "8001:8001"
+      - "18001:8001"
     env_file: [ .env ]
     environment:
       - MLFLOW_TRACKING_URI=http://mlflow-server:5000
@@ -62,7 +62,7 @@ services:
     command: >
       mlflow models serve -m "models:/RiskCategoryPredictor/Production" --host 0.0.0.0 --port 8002 --no-conda
     ports:
-      - "8002:8002"
+      - "18002:8002"
     env_file: [ .env ]
     environment:
       - MLFLOW_TRACKING_URI=http://mlflow-server:5000
@@ -78,7 +78,7 @@ services:
     command: >
       mlflow models serve -m "models:/CreditLimitPredictor/Production" --host 0.0.0.0 --port 8003 --no-conda
     ports:
-      - "8003:8003"
+      - "18003:8003"
     env_file: [ .env ]
     environment:
       - MLFLOW_TRACKING_URI=http://mlflow-server:5000
@@ -95,7 +95,7 @@ services:
     command: >
       mlflow models serve -m "models:/FraudDetector/Production" --host 0.0.0.0 --port 8004 --no-conda
     ports:
-      - "8004:8004"
+      - "18004:8004"
     env_file: [ .env ]
     environment:
       - MLFLOW_TRACKING_URI=http://mlflow-server:5000
@@ -113,8 +113,8 @@ services:
     container_name: spark-master
     command: bin/spark-class org.apache.spark.deploy.master.Master
     ports:
-      - "9080:8080"
-      - "7077:7077"
+      - "19080:8080"
+      - "17077:7077"
     environment:
       - PYSPARK_PYTHON=/opt/bitnami/python/bin/python
       - PYSPARK_DRIVER_PYTHON=/opt/bitnami/python/bin/python
@@ -161,7 +161,7 @@ services:
       - MLFLOW_DB_PASSWORD=${MLFLOW_DB_PASSWORD}
       - MLFLOW_DB_NAME=${MLFLOW_DB_NAME}
     ports:
-      - "5432:5432"
+      - "15432:5432"
     networks:
       - credit-net
     healthcheck:
@@ -177,8 +177,8 @@ services:
     image: minio/minio:RELEASE.2023-09-07T02-05-02Z # Using a specific stable tag
     container_name: minio-storage
     ports:
-      - "9000:9000" # S3 API Port
-      - "9001:9001" # MinIO Console UI Port
+      - "19000:9000" # S3 API Port
+      - "19001:9001" # MinIO Console UI Port
     command: server /data --console-address ':9001' --address ':9000'
     env_file:
       - .env
@@ -218,7 +218,7 @@ services:
     container_name: airflow-webserver
     command: webserver
     ports:
-      - "8087:8080"
+      - "18087:8080"
     depends_on:
       - scheduler
 
@@ -241,8 +241,8 @@ services:
       - ./start-mlflow.sh:/scripts/start-mlflow.sh
     command: /scripts/start-mlflow.sh
     ports:
-      - "5000:5000" # Using 5001 to avoid conflicts
-      - "6060:6060" # For MLflow UI
+      - "15000:5000"
+      - "16060:6060"
     # <<< ADDED ENVIRONMENT & DEPENDS_ON >>>
     env_file:
       - .env
@@ -300,7 +300,7 @@ services:
       - FRAUD_MODEL_VERSION=1
       - ENCODER_PATH=/opt/airflow/data/label_encoders.pkl
     ports:
-      - "8008:8000"
+      - "18008:8000"
     volumes:
       - ./fastapi/app:/app/app          # ✅ correct code mapping
       - ./data:/app/data
