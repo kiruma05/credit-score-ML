@@ -1,11 +1,21 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
+from typing import Optional
 import pandas as pd
 import numpy as np
 import requests
 import os
 
+from app.utils.response import Envelope, success_response
+
 router = APIRouter()
+
+
+class FraudPrediction(BaseModel):
+    fraud_prediction: int
+    fraud_probability: Optional[float]
+    model_version: str
+    served_from: str
 
 MODEL_NAME = os.getenv("FRAUD_MODEL_NAME", "FraudDetector")
 MODEL_VERSION = os.getenv("FRAUD_MODEL_VERSION", "1")
@@ -33,13 +43,23 @@ def get_fraud_model():
     model_info = app.state.fraud_model
     encoders = app.state.label_encoders
     if model_info is None:
-        raise HTTPException(status_code=503, detail="Fraud model not loaded.")
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "FRAUD_MODEL_UNAVAILABLE", "message": "Fraud model not loaded."},
+        )
     if encoders is None:
-        raise HTTPException(status_code=503, detail="Label encoders not loaded.")
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "ENCODERS_UNAVAILABLE", "message": "Label encoders not loaded."},
+        )
     return model_info, encoders
 
-@router.post("/predict")
-def predict_fraud(transaction: Transaction, model_encoders: tuple = Depends(get_fraud_model)):
+@router.post("/predict", response_model=Envelope[FraudPrediction])
+def predict_fraud(
+    transaction: Transaction,
+    http_request: Request,
+    model_encoders: tuple = Depends(get_fraud_model),
+):
     """Predict fraud likelihood from transaction features."""
     model_info, encoders = model_encoders
 
@@ -71,7 +91,14 @@ def predict_fraud(transaction: Transaction, model_encoders: tuple = Depends(get_
                 data[col] = data[col].astype(float)
             except ValueError as e:
                 print(f"[ERROR] Failed to convert {col} to float: {data[col].iloc[0]}")
-                raise HTTPException(status_code=500, detail=f"Invalid numeric value for {col}: {str(e)}")
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "INVALID_NUMERIC_FEATURE",
+                        "message": f"Invalid numeric value for {col}: {str(e)}",
+                        "details": {"feature": col, "value": str(data[col].iloc[0])},
+                    },
+                )
         elif col not in data.columns:
             print(f"[WARNING] Missing numeric feature {col}. Using default: 0.0")
             data[col] = 0.0
@@ -96,8 +123,12 @@ def predict_fraud(transaction: Transaction, model_encoders: tuple = Depends(get_
             )
             if response.status_code != 200:
                 raise HTTPException(
-                    status_code=500,
-                    detail=f"Served model request failed: {response.text}",
+                    status_code=502,
+                    detail={
+                        "code": "SERVED_MODEL_ERROR",
+                        "message": "Served model request failed",
+                        "details": {"upstream_status": response.status_code, "body": response.text[:500]},
+                    },
                 )
             result = response.json()
             prediction = int(result.get("predictions", [0])[0])
@@ -110,11 +141,21 @@ def predict_fraud(transaction: Transaction, model_encoders: tuple = Depends(get_
             else:
                 probability = None
 
-        return {
-            "fraud_prediction": prediction,
-            "fraud_probability": round(probability, 4) if probability is not None else None,
-            "model_version": f"{MODEL_NAME}_v{MODEL_VERSION}",
-            "served_from": model_info["type"],
-        }
+        payload = FraudPrediction(
+            fraud_prediction=prediction,
+            fraud_probability=round(probability, 4) if probability is not None else None,
+            model_version=f"{MODEL_NAME}_v{MODEL_VERSION}",
+            served_from=model_info["type"],
+        )
+        return success_response(
+            data=payload,
+            message="Fraud prediction completed",
+            request=http_request,
+        )
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Fraud prediction failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "FRAUD_PREDICTION_FAILED", "message": f"Fraud prediction failed: {str(e)}"},
+        )

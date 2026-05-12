@@ -4,7 +4,8 @@ import random
 import sys
 from datetime import datetime, date, timedelta
 from urllib.parse import quote_plus
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session, sessionmaker, joinedload
 from sqlalchemy import create_engine, text
@@ -25,6 +26,13 @@ from app.fraud.fraud_router import router as fraud_router
 from app.auth import require_api_auth
 from app.auth_router import router as auth_router
 from app.explainer import load_model_for_shap, explain_prediction, summarize_drivers
+from app.middleware import RequestIDMiddleware
+from app.utils.response import (
+    Envelope,
+    error_response,
+    paginated,
+    success_response,
+)
 
 app = FastAPI(
     title="Credit Scoring & Fraud Detection API",
@@ -40,7 +48,52 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-Id"],
 )
+app.add_middleware(RequestIDMiddleware)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Wrap HTTPException so every error response shares the envelope shape.
+
+    Endpoints can raise either a plain detail string or a structured
+    ``{"code": "...", "message": "...", "details": {...}}`` payload — we unpack
+    the structured form when available.
+    """
+    code = "HTTP_ERROR"
+    message = "Request failed"
+    details = None
+    if isinstance(exc.detail, dict):
+        code = exc.detail.get("code", code)
+        message = exc.detail.get("message", message)
+        details = exc.detail.get("details")
+    elif isinstance(exc.detail, str):
+        message = exc.detail
+    return error_response(code, message, request, details=details, status_code=exc.status_code)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return error_response(
+        code="VALIDATION_ERROR",
+        message="Request validation failed",
+        request=request,
+        details=exc.errors(),
+        status_code=422,
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    print(f"[ERROR] Unhandled exception: {exc}", file=sys.stderr)
+    return error_response(
+        code="INTERNAL_ERROR",
+        message="An unexpected error occurred",
+        request=request,
+        status_code=500,
+    )
+
 
 app.include_router(auth_router, prefix="/auth")
 app.include_router(
@@ -319,16 +372,21 @@ def _build_credit_inference(features: dict) -> dict:
     }
 
 
-@app.get("/")
-def root():
-    return {"message": "Welcome to Credit Scoring & Fraud Detection API!"}
+@app.get("/", response_model=Envelope[dict])
+def root(http_request: Request):
+    return success_response(
+        data={"service": "Credit Scoring & Fraud Detection API", "version": app.version},
+        message="Welcome to Credit Scoring & Fraud Detection API!",
+        request=http_request,
+    )
 
 
 # ─── Credit Scoring ───────────────────────────────────────────────────────────
 
-@app.post("/predict", response_model=models.PredictionResponse, tags=["Credit Scoring"])
+@app.post("/predict", response_model=Envelope[models.PredictionResponse], tags=["Credit Scoring"])
 def predict(
     request: models.PredictionRequest,
+    http_request: Request,
     local_db: Session = Depends(get_db),
     ext_db: Session = Depends(get_external_db),
     origination_db: Session = Depends(get_origination_db),
@@ -398,9 +456,9 @@ def predict(
     credit_limit = float(inference["recommended_credit_limit"]) * USD_TO_TZS_RATE
     spending_limit = max(0.0, credit_limit - outstanding)
 
-    return models.PredictionResponse(
+    prediction = models.PredictionResponse(
         customer_id=customer.customer_id,
-        request_id=str(uuid.uuid4()),
+        request_id=http_request.state.request_id,
         timestamp=datetime.utcnow().isoformat(),
         credit_score=inference["credit_score"],
         risk_category=inference["risk_category"],
@@ -414,11 +472,17 @@ def predict(
         validity_period=f"{inference['validity_period_days']} days",
         model_version=inference["model_version"],
     )
+    return success_response(
+        data=prediction,
+        message="Credit assessment completed",
+        request=http_request,
+    )
 
 
-@app.post("/explain", tags=["Credit Scoring"])
+@app.post("/explain", response_model=Envelope[dict], tags=["Credit Scoring"])
 def explain(
     request: models.PredictionRequest,
+    http_request: Request,
     local_db: Session = Depends(get_db),
     ext_db: Session = Depends(get_external_db),
     origination_db: Session = Depends(get_origination_db),
@@ -446,9 +510,9 @@ def explain(
 
     explanation_result["summary"] = summarize_drivers(explanation_result["top_drivers"])
 
-    return {
+    payload = {
         "customer_id": customer.customer_id,
-        "request_id": str(uuid.uuid4()),
+        "request_id": http_request.state.request_id,
         "timestamp": datetime.utcnow().isoformat(),
         "credit_score": inference["credit_score"],
         "risk_category": inference["risk_category"],
@@ -461,11 +525,17 @@ def explain(
         "explanation": explanation_result if not explanation_error else None,
         "explanation_error": explanation_error,
     }
+    return success_response(
+        data=payload,
+        message="Credit assessment with SHAP explanation completed",
+        request=http_request,
+    )
 
 
-@app.get("/status/{customer_id}", response_model=models.StatusResponse, tags=["Credit Scoring"])
+@app.get("/status/{customer_id}", response_model=Envelope[models.StatusResponse], tags=["Credit Scoring"])
 def status(
     customer_id: str,
+    http_request: Request,
     local_db: Session = Depends(get_db),
     _auth: models.ApiClient = Depends(require_api_auth),
 ):
@@ -474,7 +544,14 @@ def status(
         models.Customer.customer_id == customer_id
     ).first()
     if not customer:
-        raise HTTPException(status_code=404, detail=f"Customer {customer_id} not found.")
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "CUSTOMER_NOT_FOUND",
+                "message": f"Customer {customer_id} not found.",
+                "details": {"customer_id": customer_id},
+            },
+        )
 
     today = date.today()
     inference = (
@@ -508,33 +585,38 @@ def status(
             "model_version": inference.model_version,
         }
 
-    return models.StatusResponse(
-        message="Customer status retrieved.",
-        status="FOUND",
-        detail={
-            "customer_id": customer.customer_id,
-            "name": f"{customer.first_name} {customer.surname}",
-            "outstanding_balance": outstanding,
-            "active_loan_count": len(active_loans),
-            "active_loans": [
-                {
-                    "loan_ref": loan.loan_ref,
-                    "disbursed_amount": float(loan.disbursed_amount),
-                    "outstanding_balance": float(loan.outstanding_balance),
-                    "disbursal_date": loan.disbursal_date.isoformat() if loan.disbursal_date else None,
-                }
-                for loan in active_loans
-            ],
-            "credit_assessment": credit_info,
-        },
+    return success_response(
+        data=models.StatusResponse(
+            message="Customer status retrieved.",
+            status="FOUND",
+            detail={
+                "customer_id": customer.customer_id,
+                "name": f"{customer.first_name} {customer.surname}",
+                "outstanding_balance": outstanding,
+                "active_loan_count": len(active_loans),
+                "active_loans": [
+                    {
+                        "loan_ref": loan.loan_ref,
+                        "disbursed_amount": float(loan.disbursed_amount),
+                        "outstanding_balance": float(loan.outstanding_balance),
+                        "disbursal_date": loan.disbursal_date.isoformat() if loan.disbursal_date else None,
+                    }
+                    for loan in active_loans
+                ],
+                "credit_assessment": credit_info,
+            },
+        ),
+        message="Customer status retrieved",
+        request=http_request,
     )
 
 
 # ─── Loan Management ──────────────────────────────────────────────────────────
 
-@app.post("/disburse", response_model=models.StatusResponse, tags=["Loan Management"])
+@app.post("/disburse", response_model=Envelope[models.StatusResponse], tags=["Loan Management"])
 def disburse(
     request: models.DisburseRequest,
+    http_request: Request,
     local_db: Session = Depends(get_db),
     _auth: models.ApiClient = Depends(require_api_auth),
 ):
@@ -543,10 +625,24 @@ def disburse(
         models.Customer.customer_id == request.customer_id
     ).first()
     if not customer:
-        raise HTTPException(status_code=404, detail=f"Customer {request.customer_id} not found.")
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "CUSTOMER_NOT_FOUND",
+                "message": f"Customer {request.customer_id} not found.",
+                "details": {"customer_id": request.customer_id},
+            },
+        )
 
     if local_db.query(models.Loan).filter(models.Loan.loan_ref == request.loan_ref).first():
-        raise HTTPException(status_code=409, detail=f"Loan reference {request.loan_ref} already exists.")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "LOAN_REF_CONFLICT",
+                "message": f"Loan reference {request.loan_ref} already exists.",
+                "details": {"loan_ref": request.loan_ref},
+            },
+        )
 
     today = date.today()
     inference = (
@@ -562,7 +658,10 @@ def disburse(
     if not inference:
         raise HTTPException(
             status_code=403,
-            detail="No valid approved credit assessment found. Run /predict first.",
+            detail={
+                "code": "NO_VALID_ASSESSMENT",
+                "message": "No valid approved credit assessment found. Run /predict first.",
+            },
         )
 
     active_loans = (
@@ -574,11 +673,18 @@ def disburse(
     available = float(inference.recommended_credit_limit) * USD_TO_TZS_RATE - outstanding
 
     if request.amount <= 0:
-        raise HTTPException(status_code=400, detail="Disbursement amount must be positive.")
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_AMOUNT", "message": "Disbursement amount must be positive."},
+        )
     if request.amount > available:
         raise HTTPException(
             status_code=403,
-            detail=f"Requested {request.amount} exceeds available limit {round(available, 2)}.",
+            detail={
+                "code": "LIMIT_EXCEEDED",
+                "message": f"Requested {request.amount} exceeds available limit {round(available, 2)}.",
+                "details": {"requested": request.amount, "available": round(available, 2)},
+            },
         )
 
     loan = models.Loan(
@@ -594,22 +700,28 @@ def disburse(
     local_db.commit()
     local_db.refresh(loan)
 
-    return models.StatusResponse(
-        message="Loan disbursed successfully.",
-        status="ACTIVE",
-        detail={
-            "loan_ref": loan.loan_ref,
-            "customer_id": loan.customer_id,
-            "disbursed_amount": float(loan.disbursed_amount),
-            "outstanding_balance": float(loan.outstanding_balance),
-            "disbursal_date": loan.disbursal_date.isoformat(),
-        },
+    return success_response(
+        data=models.StatusResponse(
+            message="Loan disbursed successfully.",
+            status="ACTIVE",
+            detail={
+                "loan_ref": loan.loan_ref,
+                "customer_id": loan.customer_id,
+                "disbursed_amount": float(loan.disbursed_amount),
+                "outstanding_balance": float(loan.outstanding_balance),
+                "disbursal_date": loan.disbursal_date.isoformat(),
+            },
+        ),
+        message="Loan disbursed successfully",
+        request=http_request,
+        status_code=201,
     )
 
 
-@app.post("/repay", response_model=models.StatusResponse, tags=["Loan Management"])
+@app.post("/repay", response_model=Envelope[models.StatusResponse], tags=["Loan Management"])
 def repay(
     request: models.RepayRequest,
+    http_request: Request,
     local_db: Session = Depends(get_db),
     _auth: models.ApiClient = Depends(require_api_auth),
 ):
@@ -623,11 +735,28 @@ def repay(
         .first()
     )
     if not loan:
-        raise HTTPException(status_code=404, detail=f"Loan {request.loan_ref} not found for this customer.")
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "LOAN_NOT_FOUND",
+                "message": f"Loan {request.loan_ref} not found for this customer.",
+                "details": {"loan_ref": request.loan_ref, "customer_id": request.customer_id},
+            },
+        )
     if loan.status == "SETTLED":
-        raise HTTPException(status_code=400, detail=f"Loan {request.loan_ref} is already fully settled.")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "LOAN_ALREADY_SETTLED",
+                "message": f"Loan {request.loan_ref} is already fully settled.",
+                "details": {"loan_ref": request.loan_ref},
+            },
+        )
     if request.amount <= 0:
-        raise HTTPException(status_code=400, detail="Repayment amount must be positive.")
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_AMOUNT", "message": "Repayment amount must be positive."},
+        )
 
     local_db.add(models.Repayment(
         loan_ref=request.loan_ref,
@@ -643,13 +772,17 @@ def repay(
     local_db.commit()
     local_db.refresh(loan)
 
-    return models.StatusResponse(
-        message="Repayment recorded successfully.",
-        status=loan.status,
-        detail={
-            "loan_ref": loan.loan_ref,
-            "repayment_amount": request.amount,
-            "outstanding_balance": float(loan.outstanding_balance),
-            "loan_status": loan.status,
-        },
+    return success_response(
+        data=models.StatusResponse(
+            message="Repayment recorded successfully.",
+            status=loan.status,
+            detail={
+                "loan_ref": loan.loan_ref,
+                "repayment_amount": request.amount,
+                "outstanding_balance": float(loan.outstanding_balance),
+                "loan_status": loan.status,
+            },
+        ),
+        message="Repayment recorded successfully",
+        request=http_request,
     )
