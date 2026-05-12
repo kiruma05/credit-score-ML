@@ -2,13 +2,14 @@ import os
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.auth import generate_api_key, generate_api_secret, hash_secret
 from app import models
+from app.response import success_response
 
 router = APIRouter()
 
@@ -50,6 +51,7 @@ class ClientSummary(BaseModel):
 @router.post("/clients", tags=["Auth Management"])
 def create_client(
     body: CreateClientRequest,
+    http_request: Request,
     db: Session = Depends(_get_db),
     _: None = Depends(_require_admin),
 ):
@@ -77,37 +79,56 @@ def create_client(
     db.commit()
     db.refresh(client)
 
-    return {
-        "client_name": client.client_name,
-        "api_key": raw_key,
-        "api_secret": raw_secret,
-        "expires_at": body.expires_at.isoformat() if body.expires_at else None,
-        "warning": "Store api_secret securely — it will never be shown again.",
-    }
+    return success_response(
+        message="Client created successfully. Store api_secret securely — it will never be shown again.",
+        request_id=http_request.state.request_id,
+        data={
+            "client_name": client.client_name,
+            "api_key": raw_key,
+            "api_secret": raw_secret,
+            "expires_at": body.expires_at.isoformat() if body.expires_at else None,
+        },
+        status_code=201,
+    )
 
 
-@router.get("/clients", response_model=List[ClientSummary], tags=["Auth Management"])
+@router.get("/clients", tags=["Auth Management"])
 def list_clients(
+    http_request: Request,
     db: Session = Depends(_get_db),
     _: None = Depends(_require_admin),
 ):
     """List all API clients. Secrets are never exposed."""
-    return [
-        ClientSummary(
-            client_name=c.client_name,
-            api_key=c.api_key,
-            is_active=c.is_active,
-            expires_at=c.expires_at.isoformat() if c.expires_at else None,
-            created_at=c.created_at.isoformat(),
-            last_used_at=c.last_used_at.isoformat() if c.last_used_at else None,
-        )
+    clients = [
+        {
+            "client_name": c.client_name,
+            "api_key": c.api_key,
+            "is_active": c.is_active,
+            "expires_at": c.expires_at.isoformat() if c.expires_at else None,
+            "created_at": c.created_at.isoformat(),
+            "last_used_at": c.last_used_at.isoformat() if c.last_used_at else None,
+        }
         for c in db.query(models.ApiClient).all()
     ]
+    return success_response(
+        message="Clients fetched successfully",
+        request_id=http_request.state.request_id,
+        data=clients,
+        pagination={
+            "page": 1,
+            "limit": len(clients),
+            "total": len(clients),
+            "totalPages": 1,
+            "hasNext": False,
+            "hasPrevious": False,
+        },
+    )
 
 
 @router.delete("/clients/{api_key}", tags=["Auth Management"])
 def revoke_client(
     api_key: str,
+    http_request: Request,
     db: Session = Depends(_get_db),
     _: None = Depends(_require_admin),
 ):
@@ -119,4 +140,8 @@ def revoke_client(
         raise HTTPException(status_code=404, detail="Client not found.")
     client.is_active = False
     db.commit()
-    return {"message": f"Client '{client.client_name}' revoked successfully."}
+    return success_response(
+        message=f"Client '{client.client_name}' revoked successfully",
+        request_id=http_request.state.request_id,
+        data={"client_name": client.client_name, "is_active": False},
+    )

@@ -4,8 +4,11 @@ import random
 import sys
 from datetime import datetime, date, timedelta
 from urllib.parse import quote_plus
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy.orm import Session, sessionmaker, joinedload
 from sqlalchemy import create_engine, text
 from pydantic import BaseModel
@@ -25,6 +28,14 @@ from app.fraud.fraud_router import router as fraud_router
 from app.auth import require_api_auth
 from app.auth_router import router as auth_router
 from app.explainer import load_model_for_shap, explain_prediction, summarize_drivers
+from app.response import (
+    success_response,
+    error_response,
+    http_exception_handler,
+    validation_exception_handler,
+    generic_exception_handler,
+    request_id_middleware,
+)
 
 app = FastAPI(
     title="Credit Scoring & Fraud Detection API",
@@ -41,6 +52,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Attach request_id to every request
+app.add_middleware(BaseHTTPMiddleware, dispatch=request_id_middleware)
+
+# Global exception handlers — every error response follows the standard format
+app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+app.add_exception_handler(RequestValidationError, validation_exception_handler)
+app.add_exception_handler(Exception, generic_exception_handler)
 
 app.include_router(auth_router, prefix="/auth")
 app.include_router(
@@ -320,15 +339,20 @@ def _build_credit_inference(features: dict) -> dict:
 
 
 @app.get("/")
-def root():
-    return {"message": "Welcome to Credit Scoring & Fraud Detection API!"}
+def root(http_request: Request):
+    return success_response(
+        message="Welcome to Credit Scoring & Fraud Detection API",
+        request_id=http_request.state.request_id,
+        data={"service": "credit-score-engine", "version": app.version},
+    )
 
 
 # ─── Credit Scoring ───────────────────────────────────────────────────────────
 
-@app.post("/predict", response_model=models.PredictionResponse, tags=["Credit Scoring"])
+@app.post("/predict", tags=["Credit Scoring"])
 def predict(
     request: models.PredictionRequest,
+    http_request: Request,
     local_db: Session = Depends(get_db),
     ext_db: Session = Depends(get_external_db),
     origination_db: Session = Depends(get_origination_db),
@@ -398,27 +422,30 @@ def predict(
     credit_limit = float(inference["recommended_credit_limit"]) * USD_TO_TZS_RATE
     spending_limit = max(0.0, credit_limit - outstanding)
 
-    return models.PredictionResponse(
-        customer_id=customer.customer_id,
-        request_id=str(uuid.uuid4()),
-        timestamp=datetime.utcnow().isoformat(),
-        credit_score=inference["credit_score"],
-        risk_category=inference["risk_category"],
-        risk_probability=inference["risk_probability"],
-        decision=inference["decision"],
-        recommended_credit_limit=credit_limit,
-        currency="TZS",
-        spending_limit=spending_limit,
-        outstanding_balance=outstanding,
-        suggested_interest_rate=inference["suggested_interest_rate"],
-        validity_period=f"{inference['validity_period_days']} days",
-        model_version=inference["model_version"],
+    return success_response(
+        message="Credit assessment completed successfully",
+        request_id=http_request.state.request_id,
+        data={
+            "customer_id": customer.customer_id,
+            "credit_score": inference["credit_score"],
+            "risk_category": inference["risk_category"],
+            "risk_probability": inference["risk_probability"],
+            "decision": inference["decision"],
+            "recommended_credit_limit": credit_limit,
+            "currency": "TZS",
+            "spending_limit": spending_limit,
+            "outstanding_balance": outstanding,
+            "suggested_interest_rate": inference["suggested_interest_rate"],
+            "validity_period": f"{inference['validity_period_days']} days",
+            "model_version": inference["model_version"],
+        },
     )
 
 
 @app.post("/explain", tags=["Credit Scoring"])
 def explain(
     request: models.PredictionRequest,
+    http_request: Request,
     local_db: Session = Depends(get_db),
     ext_db: Session = Depends(get_external_db),
     origination_db: Session = Depends(get_origination_db),
@@ -446,26 +473,29 @@ def explain(
 
     explanation_result["summary"] = summarize_drivers(explanation_result["top_drivers"])
 
-    return {
-        "customer_id": customer.customer_id,
-        "request_id": str(uuid.uuid4()),
-        "timestamp": datetime.utcnow().isoformat(),
-        "credit_score": inference["credit_score"],
-        "risk_category": inference["risk_category"],
-        "risk_probability": inference["risk_probability"],
-        "decision": inference["decision"],
-        "recommended_credit_limit": inference["recommended_credit_limit"],
-        "suggested_interest_rate": inference["suggested_interest_rate"],
-        "validity_period": f"{inference['validity_period_days']} days",
-        "model_version": model_version,
-        "explanation": explanation_result if not explanation_error else None,
-        "explanation_error": explanation_error,
-    }
+    return success_response(
+        message="Credit score explanation generated",
+        request_id=http_request.state.request_id,
+        data={
+            "customer_id": customer.customer_id,
+            "credit_score": inference["credit_score"],
+            "risk_category": inference["risk_category"],
+            "risk_probability": inference["risk_probability"],
+            "decision": inference["decision"],
+            "recommended_credit_limit": inference["recommended_credit_limit"],
+            "suggested_interest_rate": inference["suggested_interest_rate"],
+            "validity_period": f"{inference['validity_period_days']} days",
+            "model_version": model_version,
+            "explanation": explanation_result if not explanation_error else None,
+            "explanation_error": explanation_error,
+        },
+    )
 
 
-@app.get("/status/{customer_id}", response_model=models.StatusResponse, tags=["Credit Scoring"])
+@app.get("/status/{customer_id}", tags=["Credit Scoring"])
 def status(
     customer_id: str,
+    http_request: Request,
     local_db: Session = Depends(get_db),
     _auth: models.ApiClient = Depends(require_api_auth),
 ):
@@ -508,10 +538,10 @@ def status(
             "model_version": inference.model_version,
         }
 
-    return models.StatusResponse(
-        message="Customer status retrieved.",
-        status="FOUND",
-        detail={
+    return success_response(
+        message="Customer status retrieved",
+        request_id=http_request.state.request_id,
+        data={
             "customer_id": customer.customer_id,
             "name": f"{customer.first_name} {customer.surname}",
             "outstanding_balance": outstanding,
@@ -532,9 +562,10 @@ def status(
 
 # ─── Loan Management ──────────────────────────────────────────────────────────
 
-@app.post("/disburse", response_model=models.StatusResponse, tags=["Loan Management"])
+@app.post("/disburse", tags=["Loan Management"])
 def disburse(
     request: models.DisburseRequest,
+    http_request: Request,
     local_db: Session = Depends(get_db),
     _auth: models.ApiClient = Depends(require_api_auth),
 ):
@@ -594,22 +625,24 @@ def disburse(
     local_db.commit()
     local_db.refresh(loan)
 
-    return models.StatusResponse(
-        message="Loan disbursed successfully.",
-        status="ACTIVE",
-        detail={
+    return success_response(
+        message="Loan disbursed successfully",
+        request_id=http_request.state.request_id,
+        data={
             "loan_ref": loan.loan_ref,
             "customer_id": loan.customer_id,
             "disbursed_amount": float(loan.disbursed_amount),
             "outstanding_balance": float(loan.outstanding_balance),
             "disbursal_date": loan.disbursal_date.isoformat(),
+            "status": "ACTIVE",
         },
     )
 
 
-@app.post("/repay", response_model=models.StatusResponse, tags=["Loan Management"])
+@app.post("/repay", tags=["Loan Management"])
 def repay(
     request: models.RepayRequest,
+    http_request: Request,
     local_db: Session = Depends(get_db),
     _auth: models.ApiClient = Depends(require_api_auth),
 ):
@@ -643,10 +676,10 @@ def repay(
     local_db.commit()
     local_db.refresh(loan)
 
-    return models.StatusResponse(
-        message="Repayment recorded successfully.",
-        status=loan.status,
-        detail={
+    return success_response(
+        message="Repayment recorded successfully",
+        request_id=http_request.state.request_id,
+        data={
             "loan_ref": loan.loan_ref,
             "repayment_amount": request.amount,
             "outstanding_balance": float(loan.outstanding_balance),
