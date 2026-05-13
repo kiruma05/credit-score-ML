@@ -1,10 +1,11 @@
 import os
+import subprocess
 import uuid
 import random
 import sys
 from datetime import datetime, date, timedelta
 from urllib.parse import quote_plus
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session, sessionmaker, joinedload
@@ -379,10 +380,10 @@ def _get_customer_features(customer: models.Customer, uaa_db, origination_db):
 
 
 def _build_credit_inference(features: dict) -> dict:
-    """
-    Call the 3 credit model servers. Falls back to random score for any unreachable server.
-    """
+    """Call the 3 credit model servers + apply business-rule guard rails."""
     monthly_income = float(features.get("monthly_income", random.uniform(200, 2000)))
+    dti = float(features.get("debt_to_income_ratio", 0.0))
+    active_loans = int(features.get("active_loans", 0))
 
     raw_score = _invoke_mlflow_server(CREDIT_SCORE_URI, features)
     raw_risk = _invoke_mlflow_server(CREDIT_RISK_URI, features)
@@ -390,7 +391,7 @@ def _build_credit_inference(features: dict) -> dict:
 
     credit_score = float(raw_score) if raw_score is not None else float(random.randint(300, 850))
     decision, risk_category, risk_probability, limit_usd, interest_rate, validity_days = \
-        services.apply_business_rules(credit_score, monthly_income)
+        services.apply_business_rules(credit_score, monthly_income, dti, active_loans)
 
     return {
         "credit_score": credit_score,
@@ -480,6 +481,72 @@ def health(http_request: Request):
         message="All checks passed" if everything_ok else "One or more dependencies are unhealthy",
         request=http_request,
         status_code=200 if everything_ok else 503,
+    )
+
+
+# ─── Admin ────────────────────────────────────────────────────────────────────
+
+_TRAIN_SCRIPT_CANDIDATES = (
+    "/app/airflow_jobs/train_models_pandas.py",  # mounted via docker-compose
+    "/opt/airflow/jobs/train_models_pandas.py",  # alternate mount
+)
+
+
+@app.post("/admin/retrain", response_model=Envelope[dict], tags=["Admin"])
+def admin_retrain(
+    http_request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """Trigger an asynchronous retrain of all 3 credit models.
+
+    The training script runs as a background subprocess and writes to MLflow
+    on completion. Returns immediately with the PID so callers can poll
+    MLflow / inspect logs separately.
+    """
+    admin_token = os.getenv("ADMIN_TOKEN", "")
+    if not admin_token:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "ADMIN_TOKEN_NOT_CONFIGURED",
+                    "message": "Admin token not configured on server."},
+        )
+    if not authorization or authorization != f"Bearer {admin_token}":
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "ADMIN_AUTH_FAILED",
+                    "message": "Invalid or missing admin token."},
+        )
+
+    script = next((p for p in _TRAIN_SCRIPT_CANDIDATES if os.path.exists(p)), None)
+    if script is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "TRAIN_SCRIPT_NOT_MOUNTED",
+                    "message": "Training script not found in container.",
+                    "details": {"checked": list(_TRAIN_SCRIPT_CANDIDATES)}},
+        )
+
+    env = os.environ.copy()
+    env.setdefault("MLFLOW_TRACKING_URI", os.getenv("MLFLOW_TRACKING_URI", "http://mlflow-server:5000"))
+    log_path = f"/tmp/retrain-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.log"
+    proc = subprocess.Popen(
+        ["python", script],
+        env=env,
+        stdout=open(log_path, "w"),
+        stderr=subprocess.STDOUT,
+    )
+    print(f"[INFO] Retraining started: pid={proc.pid} script={script} log={log_path}", flush=True)
+    return success_response(
+        data={
+            "job_id": proc.pid,
+            "status": "started",
+            "script": script,
+            "log_path": log_path,
+            "hint": "Watch MLflow UI for new model versions; promote to Production manually when ready.",
+        },
+        message="Retraining triggered",
+        request=http_request,
+        status_code=202,
     )
 
 

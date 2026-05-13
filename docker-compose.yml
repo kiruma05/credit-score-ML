@@ -305,6 +305,7 @@ services:
       - ./fastapi/app:/app/app          # ✅ correct code mapping
       - ./data:/app/data
       - ./data:/opt/airflow/data
+      - ./airflow/jobs:/app/airflow_jobs  # train script for /admin/retrain
     depends_on:
       postgres:
         condition: service_healthy
