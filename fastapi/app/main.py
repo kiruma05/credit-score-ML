@@ -184,6 +184,16 @@ def get_origination_db():
         db.close()
 
 def find_or_create_customer(nida: str, local_db: Session, ext_db) -> models.Customer:
+    """Resolve a customer by NIDA.
+
+    In strict mode (``SCORING_STRICT_MODE=true``) the NIDA MUST exist in
+    cms_uaa — we refuse to create a local stub because doing so would (a)
+    poison local state with a fake customer_id and (b) prevent later resolution
+    if cms_uaa is populated for that NIDA afterwards.
+
+    In demo mode we fall back to a deterministic stub so the seeded synthetic
+    scoring path can still run.
+    """
     customer = local_db.query(models.Customer).filter(models.Customer.nida == nida).first()
     if customer:
         print(f"[INFO] Customer {customer.customer_id} found locally.")
@@ -209,11 +219,31 @@ def find_or_create_customer(nida: str, local_db: Session, ext_db) -> models.Cust
                 details = dict(result._mapping)
                 print(f"[INFO] Customer found in external DB: {details.get('customer_id')}")
             else:
-                print(f"[WARNING] NIDA {nida} not found in external DB. Creating minimal record.")
+                print(f"[WARNING] NIDA {nida} not found in external DB.")
         except Exception as e:
-            print(f"[WARNING] External DB query failed: {e}. Creating minimal record.", file=sys.stderr)
+            print(f"[WARNING] External DB query failed: {e}.", file=sys.stderr)
     else:
-        print(f"[WARNING] External DB unavailable. Creating minimal record for NIDA {nida}.")
+        print(f"[WARNING] External DB unavailable for NIDA {nida}.")
+
+    if not details:
+        if SCORING_STRICT_MODE:
+            print(
+                f"[REJECT] NIDA={nida} not in cms_uaa — refusing to create local stub (strict mode).",
+                flush=True,
+            )
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "CUSTOMER_DATA_MISSING",
+                    "message": "Customer record not found in source systems",
+                    "details": {
+                        "nida": nida,
+                        "checked_sources": ["cms_uaa"],
+                        "hint": "Verify the NIDA exists in user_accounts (cms_uaa), or set SCORING_STRICT_MODE=false for demo mode.",
+                    },
+                },
+            )
+        print(f"[INFO] Demo mode — creating local stub for NIDA {nida}.")
 
     new_customer = models.Customer(
         nida=nida,
@@ -463,6 +493,77 @@ def root(http_request: Request):
         data={"service": "Credit Scoring & Fraud Detection API", "version": app.version},
         message="Welcome to Credit Scoring & Fraud Detection API!",
         request=http_request,
+    )
+
+
+@app.get("/health", response_model=Envelope[dict], tags=["System"])
+def health(http_request: Request):
+    """Liveness + dependency probe.
+
+    Returns the connectivity status of every upstream the scoring path relies
+    on (postgres, cms_uaa, cms_origination, MLflow). Use this to verify your
+    .env values before calling /predict.
+    """
+    checks = {
+        "postgres": "unknown",
+        "cms_uaa": "unknown",
+        "cms_origination": "unknown",
+        "mlflow_tracking": "unknown",
+        "strict_mode": str(SCORING_STRICT_MODE).lower(),
+    }
+
+    # Local PostgreSQL (where customer/loan state lives)
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        checks["postgres"] = "ok"
+    except Exception as e:
+        checks["postgres"] = f"error: {type(e).__name__}"
+
+    # cms_uaa
+    if ExternalSessionLocal is None:
+        checks["cms_uaa"] = "not_configured"
+    else:
+        try:
+            db = ExternalSessionLocal()
+            db.execute(text("SELECT 1"))
+            db.close()
+            checks["cms_uaa"] = "ok"
+        except Exception as e:
+            checks["cms_uaa"] = f"error: {type(e).__name__}"
+
+    # cms_origination
+    if OriginationSessionLocal is None:
+        checks["cms_origination"] = "not_configured"
+    else:
+        try:
+            db = OriginationSessionLocal()
+            db.execute(text("SELECT 1"))
+            db.close()
+            checks["cms_origination"] = "ok"
+        except Exception as e:
+            checks["cms_origination"] = f"error: {type(e).__name__}"
+
+    # MLflow tracking
+    tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "")
+    if not tracking_uri:
+        checks["mlflow_tracking"] = "not_configured"
+    else:
+        try:
+            r = requests.get(f"{tracking_uri}/health", timeout=3)
+            checks["mlflow_tracking"] = "ok" if r.status_code == 200 else f"http_{r.status_code}"
+        except Exception as e:
+            checks["mlflow_tracking"] = f"error: {type(e).__name__}"
+
+    everything_ok = all(
+        v == "ok" or v == "not_configured" or v.startswith("true") or v.startswith("false")
+        for v in checks.values()
+    )
+    return success_response(
+        data=checks,
+        message="All checks passed" if everything_ok else "One or more dependencies are unhealthy",
+        request=http_request,
+        status_code=200 if everything_ok else 503,
     )
 
 
