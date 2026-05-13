@@ -20,6 +20,9 @@ from sqlalchemy.orm import Session
 
 
 ACTIVE_STATUSES_EXCLUDE = ("REJECTED", "CANCELLED", "SETTLED", "WITHDRAWN")
+# Apps that should NOT influence scoring — drafts are incomplete, rejected/
+# cancelled/withdrawn represent customer or bank rejection respectively.
+QUALIFYING_STATUSES_EXCLUDE = ("REJECTED", "CANCELLED", "DRAFT", "WITHDRAWN")
 
 
 def _years_between(dob: Any, today: Optional[date] = None) -> Optional[int]:
@@ -206,6 +209,37 @@ def _metadata_assets_have_vehicle(metadata: Any) -> Tuple[bool, Optional[str]]:
     return False, None
 
 
+def _max_metadata_value(apps: List[dict], field: str) -> Optional[float]:
+    """Return MAX of metadata[field] across the given apps, ignoring null/<=0."""
+    vals = []
+    for a in apps:
+        m = a.get("metadata") or {}
+        v = m.get(field)
+        if isinstance(v, (int, float)) and v > 0:
+            vals.append(float(v))
+    return max(vals) if vals else None
+
+
+def _max_metadata_history_avg(apps: List[dict]) -> Optional[float]:
+    """Return MAX of monthlyIncomeHistory averages across the given apps."""
+    vals = []
+    for a in apps:
+        avg = _metadata_avg_income_history(a.get("metadata"))
+        if avg is not None and avg > 0:
+            vals.append(avg)
+    return max(vals) if vals else None
+
+
+def _latest_metadata_string(apps: List[dict], field: str) -> Optional[str]:
+    """First non-empty string value of metadata[field] across apps (latest first)."""
+    for a in apps:
+        m = a.get("metadata") or {}
+        v = m.get(field)
+        if isinstance(v, str) and v.strip():
+            return v
+    return None
+
+
 def _metadata_collateral_total(metadata: Any) -> float:
     if not isinstance(metadata, dict):
         return 0.0
@@ -227,6 +261,7 @@ def fetch_features(nida: str, uaa_db: Session, origination_db: Session) -> Tuple
         "uaa_source": "fallback",
         "party_link": "missing",
         "applications_found": 0,
+        "qualifying_apps": 0,
         "latest_app_status": None,
         "employment_found": False,
         "collateral_found": False,
@@ -293,55 +328,90 @@ def fetch_features(nida: str, uaa_db: Session, origination_db: Session) -> Tuple
         data_quality["score_basis"] = "partial_live_data"
         return features, data_quality
 
-    latest = apps[0]
-    data_quality["latest_app_status"] = latest.get("status")
-    data_quality["employment_found"] = latest.get("employment_type") is not None
+    # Qualifying = non-draft, non-rejected, non-cancelled, non-withdrawn.
+    # These are the only apps that should influence scoring — DRAFT apps are
+    # incomplete and may contain typos (e.g. monthlySalary=10).
+    qualifying_apps = [
+        a for a in apps
+        if (a.get("status") or "").upper() not in QUALIFYING_STATUSES_EXCLUDE
+    ]
+    data_quality["qualifying_apps"] = len(qualifying_apps)
+    data_quality["latest_app_status"] = apps[0].get("status")
 
-    # latest-app fields
-    if latest.get("requested_amount") is not None:
-        features["requested_amount"] = float(latest["requested_amount"])
-    features["loan_purpose"] = (latest.get("purpose_text") or latest.get("purpose_code") or "Personal")
+    # Detail source = latest qualifying (fallback to latest of any kind for
+    # the requested_amount/loan_purpose if no qualifying app exists yet).
+    detail_source = qualifying_apps[0] if qualifying_apps else apps[0]
 
-    if latest.get("employment_type"):
-        features["employment_status"] = latest["employment_type"]
-    if latest.get("duration_years"):
-        features["credit_history_length_months"] = int(latest["duration_years"]) * 12
+    # Cross-app metadata aggregates (MAX across qualifying so one bad-data
+    # app cannot drag features down).
+    max_history_avg = _max_metadata_history_avg(qualifying_apps)
+    max_monthly_salary = _max_metadata_value(qualifying_apps, "monthlySalary")
+    max_total_assets = _max_metadata_value(qualifying_apps, "totalAssetsValue")
+    max_years_employment = _max_metadata_value(qualifying_apps, "yearsInEmployment")
+    metadata_employment_status = _latest_metadata_string(qualifying_apps, "employmentStatus")
+
+    # latest-app detail fields
+    if detail_source.get("requested_amount") is not None:
+        features["requested_amount"] = float(detail_source["requested_amount"])
+    features["loan_purpose"] = (
+        detail_source.get("purpose_text") or detail_source.get("purpose_code") or "Personal"
+    )
+
+    # Employment status — table first, metadata fallback
+    if detail_source.get("employment_type"):
+        features["employment_status"] = detail_source["employment_type"]
+    elif metadata_employment_status:
+        features["employment_status"] = metadata_employment_status
+    data_quality["employment_found"] = bool(
+        detail_source.get("employment_type") or metadata_employment_status
+    )
+
+    # Credit history length — table first, metadata fallback
+    duration_years = _first_non_null(
+        detail_source.get("duration_years"),
+        max_years_employment,
+    )
+    if duration_years:
+        features["credit_history_length_months"] = int(duration_years) * 12
 
     # Override demographics with application-level if party_person was sparse
-    if not person.get("level_of_education") and latest.get("app_education"):
-        features["education"] = latest["app_education"]
-    if person.get("dependents") in (None, 0) and latest.get("app_dependents") is not None:
-        features["dependents"] = int(latest["app_dependents"])
-    if (not person.get("marital_status")) and latest.get("app_marital"):
-        features["married"] = "YES" if (latest["app_marital"] or "").upper() == "MARRIED" else "NO"
+    if not person.get("level_of_education") and detail_source.get("app_education"):
+        features["education"] = detail_source["app_education"]
+    if person.get("dependents") in (None, 0) and detail_source.get("app_dependents") is not None:
+        features["dependents"] = int(detail_source["app_dependents"])
+    if (not person.get("marital_status")) and detail_source.get("app_marital"):
+        features["married"] = "YES" if (detail_source["app_marital"] or "").upper() == "MARRIED" else "NO"
 
-    # Income priority chain
-    metadata_avg = _metadata_avg_income_history(latest.get("metadata"))
+    # Income priority chain — prefer history average (robust across 6 months)
+    # over single monthlySalary value (vulnerable to typos like "10").
     monthly_income = _first_non_null(
-        latest.get("gross_salary_monthly"),
-        (latest.get("metadata") or {}).get("monthlySalary"),
-        metadata_avg,
+        detail_source.get("gross_salary_monthly"),
+        max_history_avg,
+        max_monthly_salary,
         uaa_monthly,
     )
     if monthly_income:
         features["monthly_income"] = float(monthly_income)
 
     avg_balance = _first_non_null(
-        latest.get("net_salary_monthly"),
-        metadata_avg,
-        latest.get("gross_salary_monthly"),
+        detail_source.get("net_salary_monthly"),
+        max_history_avg,
+        detail_source.get("gross_salary_monthly"),
     )
     if avg_balance:
         features["avg_monthly_balance"] = float(avg_balance)
 
-    # Total assets from metadata if cms_uaa.credit_limit is 0
-    if not features["savings_account_balance"]:
-        total_assets = (latest.get("metadata") or {}).get("totalAssetsValue")
-        if isinstance(total_assets, (int, float)):
-            features["savings_account_balance"] = float(total_assets)
+    # Savings / liquid balance — credit_limit from cms_uaa, metadata fallback
+    if not features["savings_account_balance"] and max_total_assets:
+        features["savings_account_balance"] = float(max_total_assets)
 
-    # Active loans + outstanding debt aggregated across non-rejected apps
-    active_apps = [a for a in apps if (a.get("status") or "").upper() not in ACTIVE_STATUSES_EXCLUDE]
+    # Active loans + outstanding debt aggregated across non-rejected apps.
+    # Note: DRAFT apps DON'T count as active loans (they aren't loans yet).
+    active_apps = [
+        a for a in apps
+        if (a.get("status") or "").upper() not in ACTIVE_STATUSES_EXCLUDE
+        and (a.get("status") or "").upper() != "DRAFT"
+    ]
     features["active_loans"] = len(active_apps)
     debt = sum(float(a.get("requested_amount") or 0) for a in active_apps)
     if (person.get("has_other_loan") or "").upper() == "YES":
@@ -360,14 +430,15 @@ def fetch_features(nida: str, uaa_db: Session, origination_db: Session) -> Tuple
             min(1.0, debt / features["savings_account_balance"]), 4
         )
 
-    # Collateral aggregate (table first, metadata as fallback)
-    app_ids = [a["application_id"] for a in apps]
-    coll = _fetch_collateral(app_ids, origination_db)
+    # Collateral aggregate — qualifying apps only (drafts shouldn't grant
+    # collateral credit). Falls back to metadata.collaterals if table empty.
+    qualifying_ids = [a["application_id"] for a in qualifying_apps] or [a["application_id"] for a in apps]
+    coll = _fetch_collateral(qualifying_ids, origination_db)
     if coll.get("total_value", 0) > 0:
         features["previous_collateral_value"] = float(coll["total_value"])
         data_quality["collateral_found"] = True
     else:
-        meta_coll = _metadata_collateral_total(latest.get("metadata"))
+        meta_coll = _metadata_collateral_total(detail_source.get("metadata"))
         if meta_coll > 0:
             features["previous_collateral_value"] = meta_coll
             data_quality["collateral_found"] = True
@@ -377,20 +448,20 @@ def fetch_features(nida: str, uaa_db: Session, origination_db: Session) -> Tuple
         features["vehicle_ownership_status"] = "YES"
         features["vehicle_cat"] = coll.get("vehicle_class") or "Vehicle"
     else:
-        assets = _fetch_assets(app_ids, origination_db)
+        assets = _fetch_assets(qualifying_ids, origination_db)
         if assets.get("has_vehicle"):
             features["vehicle_ownership_status"] = "YES"
             features["vehicle_cat"] = assets.get("vehicle_desc") or "Vehicle"
         else:
-            meta_veh, meta_veh_name = _metadata_assets_have_vehicle(latest.get("metadata"))
+            meta_veh, meta_veh_name = _metadata_assets_have_vehicle(detail_source.get("metadata"))
             if meta_veh:
                 features["vehicle_ownership_status"] = "YES"
                 features["vehicle_cat"] = meta_veh_name or "Vehicle"
 
     # score_basis classification
-    if features["monthly_income"] > 500 and apps and data_quality["employment_found"]:
+    if features["monthly_income"] > 500 and qualifying_apps and data_quality["employment_found"]:
         data_quality["score_basis"] = "live_data"
-    elif apps:
+    elif qualifying_apps or apps:
         data_quality["score_basis"] = "partial_live_data"
     else:
         data_quality["score_basis"] = "uaa_only"
