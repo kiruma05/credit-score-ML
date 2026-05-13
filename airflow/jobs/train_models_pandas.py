@@ -75,7 +75,17 @@ def train():
     data_path = "/opt/airflow/data/customer_data.csv"
     df = pd.read_csv(data_path).fillna(0)
 
-    X = df.drop(columns=['customer_id', 'nida', 'risk_category_target'])
+    # Drop identifiers + targets + leakage helpers. payment_history_score is
+    # the target of CreditScorePredictor (so it must NEVER be an input feature
+    # — was causing the model to just regurgitate the default value of 500).
+    # is_approved / is_fraud / is_high_risk are derived from the target too.
+    leakage_cols = [c for c in (
+        'customer_id', 'nida',
+        'risk_category_target',
+        'payment_history_score',
+        'is_approved', 'is_fraud', 'is_high_risk',
+    ) if c in df.columns]
+    X = df.drop(columns=leakage_cols)
     y_score = df['payment_history_score']
     y_risk = df['risk_category_target']
     y_limit = df['monthly_income'] * 3

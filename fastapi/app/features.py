@@ -292,7 +292,7 @@ def fetch_features(nida: str, uaa_db: Session, origination_db: Session) -> Tuple
         "monthly_income": 500.0,
         "residense_status": "Rented", "vehicle_ownership_status": "NO",
         "vehicle_cat": "None", "credit_history_length_months": 12,
-        "payment_history_score": 500, "total_outstanding_debt": 0.0,
+        "total_outstanding_debt": 0.0,
         "credit_utilization_ratio": 0.0, "number_of_late_payments_36": 0,
         "active_loans": 0, "avg_monthly_balance": 0.0, "savings_account_balance": 0.0,
         "requested_amount": 1000.0, "loan_purpose": "Personal",
@@ -443,8 +443,8 @@ def fetch_features(nida: str, uaa_db: Session, origination_db: Session) -> Tuple
     if (person.get("has_other_loan") or "").upper() == "YES":
         features["active_loans"] += 1
         debt += float(person.get("other_loan_monthly_repayment") or 0) * 12
-    if (person.get("has_previous_loan") or "").upper() == "YES":
-        features["payment_history_score"] = 700
+    # Note: payment_history_score is the model TARGET — not an input feature.
+    # Previous-loan signal is captured via active_loans / debt aggregates.
     features["total_outstanding_debt"] = debt
 
     # Debt-to-income / utilisation (guard against div-by-zero)
