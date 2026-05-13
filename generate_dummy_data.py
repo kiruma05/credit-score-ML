@@ -13,7 +13,24 @@ import os
 import numpy as np
 import pandas as pd
 
-OUT_PATH = os.path.join(os.path.dirname(__file__), "data", "customer_data.csv")
+def _resolve_out_path() -> str:
+    """Prefer DATA_OUTPUT_PATH env var → /opt/airflow/data (inside scheduler /
+    fastapi-app containers) → repo-relative ./data (host)."""
+    env_override = os.environ.get("DATA_OUTPUT_PATH")
+    if env_override:
+        return env_override
+    for candidate in (
+        "/opt/airflow/data/customer_data.csv",
+        os.path.join(os.path.dirname(__file__), "data", "customer_data.csv"),
+    ):
+        parent = os.path.dirname(candidate)
+        if os.path.isdir(parent):
+            return candidate
+    # last-resort fallback — at least the file lands somewhere readable
+    return "/tmp/customer_data.csv"
+
+
+OUT_PATH = _resolve_out_path()
 
 
 def _log_uniform(low, high, size, rng):
