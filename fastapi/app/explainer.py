@@ -53,13 +53,18 @@ def explain_prediction(model, features: dict, top_n: int = 5) -> dict:
 
         if preprocessor is not None:
             X = preprocessor.transform(df)
-            # Get feature names after transformation if available
+            # ColumnTransformer can return scipy.sparse — densify for SHAP.
+            if hasattr(X, "toarray"):
+                X = X.toarray()
+            # Force float dtype: SHAP's TreeExplainer calls np.isnan which
+            # rejects object/mixed arrays.
+            X = np.asarray(X, dtype=np.float64)
             try:
                 transformed_names = preprocessor.get_feature_names_out()
             except Exception:
                 transformed_names = [f"feature_{i}" for i in range(X.shape[1])]
         else:
-            X = df.values
+            X = np.asarray(df.values, dtype=np.float64)
             transformed_names = feature_names
 
         explainer = shap.TreeExplainer(estimator)
