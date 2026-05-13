@@ -78,25 +78,74 @@ def _load_background(n: int = 50, columns: Optional[list] = None) -> Optional[pd
     return None
 
 
-def explain_prediction(model, features: dict, top_n: int = 5) -> dict:
-    """Compute SHAP values for a single prediction.
-
-    Uses the model-agnostic ``shap.Explainer(model.predict, background)`` so
-    we can hand the whole Pipeline to SHAP and avoid pre/post-processing
-    nightmares. Falls back to ``feature_importances_`` if SHAP fails or the
-    background CSV is unavailable.
-    """
-    feature_names = list(features.keys())
-    df = pd.DataFrame([features])
-
-    # Match the dtype expectations of the trained pipeline.
+def _normalize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """Force object columns to str, numeric to float — matches training prep."""
     for col in df.columns:
         if df[col].dtype == object:
             df[col] = df[col].fillna("None").astype(str)
         else:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    return df
+
+
+def _map_transformed_to_original(
+    transformed_names: list, values: np.ndarray, original_columns: list
+) -> dict:
+    """Sum SHAP values back per original column (one-hot expands to many cols)."""
+    per_original = {col: 0.0 for col in original_columns}
+    for tname, val in zip(transformed_names, values):
+        # transformed names look like "num__monthly_income" or "cat__employment_status_EMPLOYED"
+        after = tname.split("__", 1)[-1]
+        # Find which original column owns this transformed feature
+        owner = None
+        for col in original_columns:
+            if after == col or after.startswith(col + "_"):
+                owner = col
+                break
+        if owner is None:
+            owner = after  # last-resort: keep transformed name
+            per_original.setdefault(owner, 0.0)
+        per_original[owner] += float(val)
+    return per_original
+
+
+def explain_prediction(model, features: dict, top_n: int = 5) -> dict:
+    """Compute SHAP values for a single prediction.
+
+    Strategy: transform both the request row AND the background CSV through
+    the pipeline's preprocessor (StandardScaler + OneHotEncoder) to a fully
+    numeric float64 matrix, then run ``shap.TreeExplainer`` on the inner
+    estimator with that matrix. Finally aggregate SHAP values back per
+    original feature so explanations are human-readable.
+
+    Falls back to ``feature_importances_`` only if SHAP genuinely cannot run.
+    """
+    feature_names = list(features.keys())
+    df = _normalize_dtypes(pd.DataFrame([features]))
 
     preprocessor, estimator = _extract_pipeline_parts(model)
+    if preprocessor is None:
+        # No preprocessing — try TreeExplainer directly on numeric values.
+        try:
+            import shap
+            X = np.asarray(df.values, dtype=np.float64)
+            explainer = shap.TreeExplainer(estimator)
+            sv = explainer.shap_values(X)
+            values = np.asarray(sv).flatten()[: len(feature_names)]
+            base = float(explainer.expected_value)
+            contributions = sorted(
+                zip(feature_names, values), key=lambda x: abs(x[1]), reverse=True
+            )
+            drivers = [
+                {"feature": n, "impact": round(float(v), 4),
+                 "direction": "helps_score" if v > 0 else "hurts_score",
+                 "value": features.get(n)}
+                for n, v in contributions[:top_n] if abs(v) > 1e-6
+            ]
+            return {"top_drivers": drivers, "base_score": round(base, 2), "method": "shap"}
+        except Exception as e:
+            logger.warning("SHAP (no-preprocessor) failed: %s", e)
+            return _fallback_importance(estimator, feature_names, features, top_n)
 
     try:
         import shap
@@ -104,27 +153,45 @@ def explain_prediction(model, features: dict, top_n: int = 5) -> dict:
         bg = _load_background(columns=df.columns.tolist())
         if bg is None or len(bg) == 0:
             raise RuntimeError("SHAP background dataset unavailable")
+        bg = _normalize_dtypes(bg.copy())
 
-        # Align dtypes between request row and background.
-        for col in df.columns:
-            if col in bg.columns and df[col].dtype != bg[col].dtype:
-                try:
-                    df[col] = df[col].astype(bg[col].dtype)
-                except (ValueError, TypeError):
-                    pass
+        # Transform both through the pipeline preprocessor → numeric float64.
+        bg_X = preprocessor.transform(bg)
+        if hasattr(bg_X, "toarray"):
+            bg_X = bg_X.toarray()
+        bg_X = np.asarray(bg_X, dtype=np.float64)
 
-        explainer = shap.Explainer(model.predict, bg)
-        sv = explainer(df)
-        # sv.values shape: (1, n_features); sv.base_values shape: (1,)
-        values = np.asarray(sv.values[0], dtype=np.float64)
-        base = float(np.asarray(sv.base_values).flatten()[0])
+        input_X = preprocessor.transform(df)
+        if hasattr(input_X, "toarray"):
+            input_X = input_X.toarray()
+        input_X = np.asarray(input_X, dtype=np.float64)
 
-        contributions = [
-            (name, float(val))
-            for name, val in zip(df.columns, values)
-            if abs(val) > 1e-6
-        ]
-        contributions.sort(key=lambda x: abs(x[1]), reverse=True)
+        # TreeExplainer with background → proper expected_value baseline.
+        explainer = shap.TreeExplainer(
+            estimator, bg_X, feature_perturbation="interventional"
+        )
+        shap_values = explainer.shap_values(input_X)
+        if isinstance(shap_values, list):
+            values = shap_values[0][0] if shap_values[0].ndim == 2 else shap_values[0]
+        else:
+            values = shap_values[0] if shap_values.ndim == 2 else shap_values
+
+        try:
+            transformed_names = list(preprocessor.get_feature_names_out())
+        except Exception:
+            transformed_names = [f"feature_{i}" for i in range(len(values))]
+
+        # Aggregate one-hot impacts back per original input column.
+        per_original = _map_transformed_to_original(
+            transformed_names, values, feature_names
+        )
+        contributions = sorted(per_original.items(), key=lambda x: abs(x[1]), reverse=True)
+
+        expected_value = explainer.expected_value
+        if isinstance(expected_value, (list, np.ndarray)):
+            base = float(np.asarray(expected_value).flatten()[0])
+        else:
+            base = float(expected_value)
 
         drivers = [
             {
@@ -134,6 +201,7 @@ def explain_prediction(model, features: dict, top_n: int = 5) -> dict:
                 "value": features.get(name),
             }
             for name, val in contributions[:top_n]
+            if abs(val) > 1e-6
         ]
         return {"top_drivers": drivers, "base_score": round(base, 2), "method": "shap"}
 
