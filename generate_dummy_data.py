@@ -62,14 +62,15 @@ def generate(num_records: int = 10000, seed: int = 42) -> pd.DataFrame:
     vehicle_cat = np.where(
         vehicle_ownership_status == "YES",
         rng.choice(["CAR", "MOTORCYCLE", "TRUCK"], size=num_records, p=[0.5, 0.4, 0.1]),
-        "None",
+        "NONE",
     )
 
     # ─── Financial — TZS scale ────────────────────────────────────────────────
-    # Log-uniform: heavy-tailed, most customers earn 500K-5M, few earn 20M+
-    monthly_income = _log_uniform(200_000, 50_000_000, num_records, rng).round(2)
+    # Log-uniform: heavy-tailed, most customers earn 500K-5M, top tier up to 300M
+    # (covers high-income production customers like Athumani with 120M).
+    monthly_income = _log_uniform(200_000, 300_000_000, num_records, rng).round(2)
     annual_income = (monthly_income * 12 * rng.normal(1.0, 0.05, num_records)).round(2)
-    credit_limit = (_log_uniform(50_000, 500_000_000, num_records, rng)).round(2)
+    credit_limit = (_log_uniform(50_000, 1_000_000_000, num_records, rng)).round(2)
 
     # Debt skewed toward 0 (most customers have little outstanding debt)
     debt_multiplier = rng.beta(0.5, 2.0, num_records) * 20  # mostly 0..3, rare up to 20
@@ -83,14 +84,14 @@ def generate(num_records: int = 10000, seed: int = 42) -> pd.DataFrame:
     avg_monthly_balance = (monthly_income * rng.uniform(0.5, 1.5, num_records)).round(2)
     savings_account_balance = (monthly_income * rng.uniform(0.0, 12.0, num_records)).round(2)
 
-    requested_amount = _log_uniform(500_000, 50_000_000, num_records, rng).round(2)
+    requested_amount = _log_uniform(500_000, 300_000_000, num_records, rng).round(2)
     loan_purpose = rng.choice(
-        ["Personal", "Business", "Home renovation", "Education", "Medical", "Vehicle"],
+        ["PERSONAL", "BUSINESS", "HOME_RENOVATION", "EDUCATION", "MEDICAL", "VEHICLE"],
         size=num_records, p=[0.30, 0.30, 0.10, 0.10, 0.10, 0.10],
     )
     previous_collateral_value = np.where(
         rng.uniform(size=num_records) < 0.4,  # 40% have any collateral
-        _log_uniform(100_000, 200_000_000, num_records, rng).round(2),
+        _log_uniform(100_000, 500_000_000, num_records, rng).round(2),
         0.0,
     )
 

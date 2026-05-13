@@ -286,11 +286,15 @@ def fetch_features(nida: str, uaa_db: Session, origination_db: Session) -> Tuple
         "score_basis": "seeded_defaults",
     }
 
+    # Defaults match the UPPERCASE casing the trainer's OneHotEncoder learned
+    # from generate_dummy_data.py. Mixed-case strings (e.g. "Employed") are
+    # treated as unknown by handle_unknown='ignore', which silently dropped
+    # the categorical signal entirely.
     features = {
-        "age": 35, "married": "NO", "education": "Graduate", "dependents": 0,
-        "employment_status": "Employed", "spouse_employment_status": "Unemployed",
+        "age": 35, "married": "NO", "education": "SECONDARY", "dependents": 0,
+        "employment_status": "EMPLOYED", "spouse_employment_status": "NOT_APPLICABLE",
         "monthly_income": 500.0,
-        "residense_status": "Rented", "vehicle_ownership_status": "NO",
+        "residense_status": "RENTED", "vehicle_ownership_status": "NO",
         "vehicle_cat": "None", "credit_history_length_months": 12,
         "total_outstanding_debt": 0.0,
         "credit_utilization_ratio": 0.0, "number_of_late_payments_36": 0,
@@ -483,6 +487,18 @@ def fetch_features(nida: str, uaa_db: Session, origination_db: Session) -> Tuple
             if meta_veh:
                 features["vehicle_ownership_status"] = "YES"
                 features["vehicle_cat"] = meta_veh_name or "Vehicle"
+
+    # Normalize categorical features to UPPERCASE so they match the
+    # OneHotEncoder categories the trainer learned from. Mixed-case values
+    # (e.g. "Employed") would be encoded as zeros by handle_unknown='ignore'.
+    _CATEGORICAL_FEATURES = (
+        "married", "education", "employment_status", "spouse_employment_status",
+        "residense_status", "vehicle_ownership_status", "vehicle_cat", "loan_purpose",
+    )
+    for k in _CATEGORICAL_FEATURES:
+        v = features.get(k)
+        if isinstance(v, str):
+            features[k] = v.upper()
 
     # score_basis classification
     if features["monthly_income"] > 500 and qualifying_apps and data_quality["employment_found"]:
