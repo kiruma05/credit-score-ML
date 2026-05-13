@@ -40,11 +40,15 @@ def explain_prediction(model, features: dict, top_n: int = 5) -> dict:
     feature_names = list(features.keys())
     df = pd.DataFrame([features])
 
+    # Preserve string dtypes for categorical features — the trained
+    # OneHotEncoder expects raw category strings ("EMPLOYED", "PRIMARY", etc.).
+    # Only coerce numeric-looking values; leave object columns untouched.
     for col in df.columns:
-        try:
-            df[col] = df[col].astype(float)
-        except (ValueError, TypeError):
-            df[col] = 0.0
+        if df[col].dtype == object:
+            # ensure stringified, not None
+            df[col] = df[col].fillna("None").astype(str)
+        else:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
     preprocessor, estimator = _extract_pipeline_parts(model)
 
