@@ -26,6 +26,7 @@ from app.fraud.fraud_router import router as fraud_router
 from app.auth import require_api_auth
 from app.auth_router import router as auth_router
 from app.explainer import load_model_for_shap, explain_prediction, summarize_drivers
+from app.features import fetch_features
 from app.middleware import RequestIDMiddleware
 from app.utils.response import (
     Envelope,
@@ -332,83 +333,15 @@ def _seed_synthetic_features(features: dict, nida: str) -> None:
 
 
 def _get_customer_features(customer: models.Customer, uaa_db, origination_db):
+    """Resolve the 22 model features for a customer.
+
+    Thin wrapper over ``features.fetch_features``. Adds strict-mode rejection
+    and the demo-mode seeded fallback that the new module deliberately does
+    not handle (so it remains testable in isolation).
     """
-    Fetch financial features from cms_uaa (income) and cms_origination (loan history).
+    feats, data_quality = fetch_features(customer.nida, uaa_db, origination_db)
 
-    Returns ``(features, data_quality)`` where ``data_quality`` describes whether
-    each source was hit live or fell back. When neither source has data and
-    SCORING_STRICT_MODE=true, raises 404 instead of producing a fake score.
-    """
-    features = {
-        "age": 35, "married": "NO", "education": "Graduate", "dependents": 0,
-        "employment_status": "Employed", "spouse_employment_status": "Unemployed",
-        "monthly_income": round(random.uniform(200, 2000), 2),
-        "residense_status": "Rented", "vehicle_ownership_status": "NO",
-        "vehicle_cat": "None", "credit_history_length_months": 12,
-        "payment_history_score": 500, "total_outstanding_debt": 0,
-        "credit_utilization_ratio": 0.0, "number_of_late_payments_36": 0,
-        "active_loans": 0, "avg_monthly_balance": 0, "savings_account_balance": 0,
-        "requested_amount": 1000, "loan_purpose": "Personal",
-        "previous_collateral_value": 0, "debt_to_income_ratio": 0.0,
-    }
-
-    uaa_hit = False
-    origination_hit = False
-
-    # --- cms_uaa: income, age, credit_limit ---
-    if uaa_db is not None:
-        try:
-            q = text("""
-                SELECT
-                    CASE WHEN date_of_birth IS NOT NULL AND date_of_birth != ''
-                         THEN DATE_PART('year', AGE(date_of_birth::date))::int
-                         ELSE 35 END                            AS age,
-                    COALESCE(monthly_income, annual_income / 12, 500)::float  AS monthly_income,
-                    COALESCE(annual_income, 0)::float                         AS annual_income,
-                    COALESCE(credit_limit, 0)::float                          AS savings_account_balance
-                FROM user_accounts
-                WHERE uuid = :cid AND deleted = false
-                LIMIT 1
-            """)
-            result = uaa_db.execute(q, {"cid": customer.customer_id}).first()
-            if result:
-                features.update({k: v for k, v in dict(result._mapping).items() if v is not None})
-                uaa_hit = True
-        except Exception as e:
-            print(f"[WARNING] UAA features query failed: {e}", file=sys.stderr)
-
-    # --- cms_origination: loan history, employment, collateral ---
-    if origination_db is not None:
-        try:
-            q = text("""
-                SELECT
-                    COALESCE(ep.employment_type, 'Employed')                         AS employment_status,
-                    COALESCE(ep.gross_salary_monthly, 0)::float                      AS avg_monthly_balance,
-                    COALESCE(ep.duration_years * 12, 12)                             AS credit_history_length_months,
-                    COUNT(DISTINCT la.application_id)
-                        FILTER (WHERE la.status NOT IN ('REJECTED','CANCELLED'))     AS active_loans,
-                    COALESCE(SUM(la.requested_amount)
-                        FILTER (WHERE la.status NOT IN ('REJECTED','CANCELLED')), 0) AS total_outstanding_debt,
-                    COALESCE(MAX(la.requested_amount), 1000)                         AS requested_amount,
-                    COALESCE(MAX(la.loan_purpose), 'Personal')                       AS loan_purpose,
-                    COALESCE(MAX(ci.estimated_value), 0)                             AS previous_collateral_value
-                FROM loan_application la
-                LEFT JOIN employment_profile ep ON ep.application_id = la.application_id
-                LEFT JOIN collateral_item ci    ON ci.application_id = la.application_id
-                WHERE la.borrower_party_id = :cid
-                GROUP BY ep.employment_type, ep.gross_salary_monthly, ep.duration_years
-                LIMIT 1
-            """)
-            result = origination_db.execute(q, {"cid": customer.customer_id}).first()
-            if result:
-                features.update({k: v for k, v in dict(result._mapping).items() if v is not None})
-                origination_hit = True
-        except Exception as e:
-            print(f"[WARNING] Origination features query failed: {e}", file=sys.stderr)
-
-    # Strict mode: refuse to score when we have no UAA record. Without UAA we
-    # have no age/income — every score would be a fabrication of defaults.
-    if not uaa_hit:
+    if data_quality["uaa_source"] == "fallback":
         if SCORING_STRICT_MODE:
             print(
                 f"[REJECT] NIDA={customer.nida} customer_id={customer.customer_id} "
@@ -428,38 +361,21 @@ def _get_customer_features(customer: models.Customer, uaa_db, origination_db):
                     },
                 },
             )
-        # Demo mode: seed features deterministically per NIDA so each customer
-        # gets a distinct (but reproducible) score.
         print(
             f"[FALLBACK] NIDA={customer.nida} customer_id={customer.customer_id} "
-            f"uaa_hit=False origination_hit={origination_hit} → seeded synthetic features.",
+            f"→ seeded synthetic features (demo mode).",
             flush=True,
         )
-        _seed_synthetic_features(features, customer.nida)
-    elif not origination_hit:
+        _seed_synthetic_features(feats, customer.nida)
+    elif data_quality["score_basis"] != "live_data":
         print(
             f"[PARTIAL] NIDA={customer.nida} customer_id={customer.customer_id} "
-            f"uaa_hit=True origination_hit=False → using origination defaults.",
+            f"score_basis={data_quality['score_basis']} apps={data_quality['applications_found']} "
+            f"employment={data_quality['employment_found']}.",
             flush=True,
         )
 
-    monthly = float(features["monthly_income"])
-    debt = float(features["total_outstanding_debt"])
-    features["debt_to_income_ratio"] = round(debt / monthly, 4) if monthly > 0 else 0.0
-
-    if uaa_hit and origination_hit:
-        score_basis = "live_data"
-    elif uaa_hit:
-        score_basis = "partial_live_data"
-    else:
-        score_basis = "seeded_defaults"
-
-    data_quality = {
-        "uaa_source": "live" if uaa_hit else "fallback",
-        "origination_source": "live" if origination_hit else "fallback",
-        "score_basis": score_basis,
-    }
-    return features, data_quality
+    return feats, data_quality
 
 
 def _build_credit_inference(features: dict) -> dict:
