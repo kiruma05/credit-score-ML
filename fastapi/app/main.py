@@ -274,10 +274,40 @@ def _invoke_mlflow_server(uri: str, features: dict):
     return None
 
 
-def _get_customer_features(customer: models.Customer, uaa_db, origination_db) -> dict:
+SCORING_STRICT_MODE = os.getenv("SCORING_STRICT_MODE", "true").lower() == "true"
+
+
+def _seed_synthetic_features(features: dict, nida: str) -> None:
+    """Overwrite default features with deterministic, NIDA-seeded values.
+
+    Same NIDA always yields the same features (and therefore the same score),
+    different NIDAs yield different feature vectors. Used only when external
+    customer data is unavailable AND strict mode is disabled.
+    """
+    rng = random.Random(hash(nida))
+    monthly_income = round(rng.uniform(200, 2000), 2)
+    features.update({
+        "monthly_income": monthly_income,
+        "payment_history_score": rng.randint(300, 750),
+        "credit_history_length_months": rng.randint(6, 60),
+        "active_loans": rng.randint(0, 3),
+        "number_of_late_payments_36": rng.randint(0, 5),
+        "total_outstanding_debt": round(rng.uniform(0, monthly_income * 6), 2),
+        "credit_utilization_ratio": round(rng.uniform(0, 1), 4),
+        "avg_monthly_balance": round(rng.uniform(0, monthly_income * 1.2), 2),
+        "savings_account_balance": round(rng.uniform(0, monthly_income * 3), 2),
+        "requested_amount": rng.randint(500, 5000),
+        "age": rng.randint(21, 65),
+    })
+
+
+def _get_customer_features(customer: models.Customer, uaa_db, origination_db):
     """
     Fetch financial features from cms_uaa (income) and cms_origination (loan history).
-    Falls back to defaults for any unavailable source.
+
+    Returns ``(features, data_quality)`` where ``data_quality`` describes whether
+    each source was hit live or fell back. When neither source has data and
+    SCORING_STRICT_MODE=true, raises 404 instead of producing a fake score.
     """
     features = {
         "age": 35, "married": "NO", "education": "Graduate", "dependents": 0,
@@ -291,6 +321,9 @@ def _get_customer_features(customer: models.Customer, uaa_db, origination_db) ->
         "requested_amount": 1000, "loan_purpose": "Personal",
         "previous_collateral_value": 0, "debt_to_income_ratio": 0.0,
     }
+
+    uaa_hit = False
+    origination_hit = False
 
     # --- cms_uaa: income, age, credit_limit ---
     if uaa_db is not None:
@@ -310,6 +343,7 @@ def _get_customer_features(customer: models.Customer, uaa_db, origination_db) ->
             result = uaa_db.execute(q, {"cid": customer.customer_id}).first()
             if result:
                 features.update({k: v for k, v in dict(result._mapping).items() if v is not None})
+                uaa_hit = True
         except Exception as e:
             print(f"[WARNING] UAA features query failed: {e}", file=sys.stderr)
 
@@ -338,13 +372,64 @@ def _get_customer_features(customer: models.Customer, uaa_db, origination_db) ->
             result = origination_db.execute(q, {"cid": customer.customer_id}).first()
             if result:
                 features.update({k: v for k, v in dict(result._mapping).items() if v is not None})
+                origination_hit = True
         except Exception as e:
             print(f"[WARNING] Origination features query failed: {e}", file=sys.stderr)
+
+    # Strict mode: refuse to score when we have no UAA record. Without UAA we
+    # have no age/income — every score would be a fabrication of defaults.
+    if not uaa_hit:
+        if SCORING_STRICT_MODE:
+            print(
+                f"[REJECT] NIDA={customer.nida} customer_id={customer.customer_id} "
+                f"not found in cms_uaa — refusing to score (strict mode).",
+                flush=True,
+            )
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "CUSTOMER_DATA_MISSING",
+                    "message": "Customer record not found in source systems",
+                    "details": {
+                        "nida": customer.nida,
+                        "customer_id": customer.customer_id,
+                        "checked_sources": ["cms_uaa", "cms_origination"],
+                        "hint": "Verify the NIDA exists in user_accounts, or set SCORING_STRICT_MODE=false for demo mode.",
+                    },
+                },
+            )
+        # Demo mode: seed features deterministically per NIDA so each customer
+        # gets a distinct (but reproducible) score.
+        print(
+            f"[FALLBACK] NIDA={customer.nida} customer_id={customer.customer_id} "
+            f"uaa_hit=False origination_hit={origination_hit} → seeded synthetic features.",
+            flush=True,
+        )
+        _seed_synthetic_features(features, customer.nida)
+    elif not origination_hit:
+        print(
+            f"[PARTIAL] NIDA={customer.nida} customer_id={customer.customer_id} "
+            f"uaa_hit=True origination_hit=False → using origination defaults.",
+            flush=True,
+        )
 
     monthly = float(features["monthly_income"])
     debt = float(features["total_outstanding_debt"])
     features["debt_to_income_ratio"] = round(debt / monthly, 4) if monthly > 0 else 0.0
-    return features
+
+    if uaa_hit and origination_hit:
+        score_basis = "live_data"
+    elif uaa_hit:
+        score_basis = "partial_live_data"
+    else:
+        score_basis = "seeded_defaults"
+
+    data_quality = {
+        "uaa_source": "live" if uaa_hit else "fallback",
+        "origination_source": "live" if origination_hit else "fallback",
+        "score_basis": score_basis,
+    }
+    return features, data_quality
 
 
 def _build_credit_inference(features: dict) -> dict:
@@ -409,6 +494,8 @@ def predict(
         .first()
     )
 
+    data_quality = None
+
     if cached:
         print(f"[INFO] Returning cached inference for customer {customer.customer_id}")
         inference = {
@@ -421,28 +508,42 @@ def predict(
             "validity_period_days": cached.validity_period_days,
             "model_version": cached.model_version,
         }
+        # Anything in the cache is live data (we never persist fallback scores).
+        data_quality = {
+            "uaa_source": "live",
+            "origination_source": "live",
+            "score_basis": "live_data_cached",
+        }
     else:
-        features = _get_customer_features(customer, ext_db, origination_db)
+        features, data_quality = _get_customer_features(customer, ext_db, origination_db)
         inference = _build_credit_inference(features)
         model_version = get_production_model_version("CreditScorePredictor")
         inference["model_version"] = model_version
 
-        new_inference = models.CachedInference(
-            customer_id=customer.customer_id,
-            credit_score=inference["credit_score"],
-            decision=inference["decision"],
-            recommended_credit_limit=inference["recommended_credit_limit"],
-            suggested_interest_rate=inference["suggested_interest_rate"],
-            risk_category=inference["risk_category"],
-            risk_probability=inference["risk_probability"],
-            validity_period_days=inference["validity_period_days"],
-            last_inference_date=today,
-            end_inference_date=today + timedelta(days=inference["validity_period_days"]),
-            model_version=model_version,
-        )
-        local_db.add(new_inference)
-        local_db.commit()
-        print(f"[INFO] New inference created for customer {customer.customer_id}")
+        # Only cache scores grounded in live data — fallback scores must re-run
+        # on every call so the moment real cms_uaa data lands, scoring refreshes.
+        if data_quality["score_basis"] == "live_data":
+            new_inference = models.CachedInference(
+                customer_id=customer.customer_id,
+                credit_score=inference["credit_score"],
+                decision=inference["decision"],
+                recommended_credit_limit=inference["recommended_credit_limit"],
+                suggested_interest_rate=inference["suggested_interest_rate"],
+                risk_category=inference["risk_category"],
+                risk_probability=inference["risk_probability"],
+                validity_period_days=inference["validity_period_days"],
+                last_inference_date=today,
+                end_inference_date=today + timedelta(days=inference["validity_period_days"]),
+                model_version=model_version,
+            )
+            local_db.add(new_inference)
+            local_db.commit()
+            print(f"[INFO] New inference cached for customer {customer.customer_id}")
+        else:
+            print(
+                f"[INFO] Inference for {customer.customer_id} not cached "
+                f"(score_basis={data_quality['score_basis']})."
+            )
 
     active_loans = (
         local_db.query(models.Loan)
@@ -471,6 +572,7 @@ def predict(
         suggested_interest_rate=inference["suggested_interest_rate"],
         validity_period=f"{inference['validity_period_days']} days",
         model_version=inference["model_version"],
+        data_quality=data_quality,
     )
     return success_response(
         data=prediction,
@@ -493,7 +595,7 @@ def explain(
     Shows which features drove the credit score up or down for this customer.
     """
     customer = find_or_create_customer(request.nida, local_db, ext_db)
-    features = _get_customer_features(customer, ext_db, origination_db)
+    features, data_quality = _get_customer_features(customer, ext_db, origination_db)
     inference = _build_credit_inference(features)
     model_version = get_production_model_version("CreditScorePredictor")
 
@@ -522,6 +624,7 @@ def explain(
         "suggested_interest_rate": inference["suggested_interest_rate"],
         "validity_period": f"{inference['validity_period_days']} days",
         "model_version": model_version,
+        "data_quality": data_quality,
         "explanation": explanation_result if not explanation_error else None,
         "explanation_error": explanation_error,
     }
