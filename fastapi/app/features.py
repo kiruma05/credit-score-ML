@@ -230,6 +230,24 @@ def _max_metadata_history_avg(apps: List[dict]) -> Optional[float]:
     return max(vals) if vals else None
 
 
+def _max_employment_field(apps: List[dict], field: str) -> Optional[float]:
+    """Return MAX of an employment_profile column across the given apps.
+
+    Ignores nulls and non-positive values (sometimes test data is typo'd to
+    tiny values like 3 or 10 — those should not pull the customer's income
+    feature below the value supported by their own income history)."""
+    vals = []
+    for a in apps:
+        v = a.get(field)
+        try:
+            fv = float(v) if v is not None else None
+        except (TypeError, ValueError):
+            fv = None
+        if fv is not None and fv > 0:
+            vals.append(fv)
+    return max(vals) if vals else None
+
+
 def _latest_metadata_string(apps: List[dict], field: str) -> Optional[str]:
     """First non-empty string value of metadata[field] across apps (latest first)."""
     for a in apps:
@@ -382,24 +400,32 @@ def fetch_features(nida: str, uaa_db: Session, origination_db: Session) -> Tuple
     if (not person.get("marital_status")) and detail_source.get("app_marital"):
         features["married"] = "YES" if (detail_source["app_marital"] or "").upper() == "MARRIED" else "NO"
 
-    # Income priority chain — prefer history average (robust across 6 months)
-    # over single monthlySalary value (vulnerable to typos like "10").
-    monthly_income = _first_non_null(
-        detail_source.get("gross_salary_monthly"),
-        max_history_avg,
-        max_monthly_salary,
-        uaa_monthly,
-    )
-    if monthly_income:
-        features["monthly_income"] = float(monthly_income)
+    # Income — take the MAX across every income signal we have.
+    # Priority-style fallback breaks when test data has typo'd small values
+    # (e.g. employment_profile.gross_salary_monthly = 3) which would otherwise
+    # short-circuit before reaching the robust 6-month metadata history.
+    max_employment_gross = _max_employment_field(qualifying_apps, "gross_salary_monthly")
+    max_employment_net = _max_employment_field(qualifying_apps, "net_salary_monthly")
+    income_candidates = [
+        v for v in (
+            max_employment_gross,
+            max_history_avg,
+            max_monthly_salary,
+            uaa_monthly,
+        ) if v is not None and v > 0
+    ]
+    if income_candidates:
+        features["monthly_income"] = float(max(income_candidates))
 
-    avg_balance = _first_non_null(
-        detail_source.get("net_salary_monthly"),
-        max_history_avg,
-        detail_source.get("gross_salary_monthly"),
-    )
-    if avg_balance:
-        features["avg_monthly_balance"] = float(avg_balance)
+    avg_balance_candidates = [
+        v for v in (
+            max_employment_net,
+            max_history_avg,
+            max_employment_gross,
+        ) if v is not None and v > 0
+    ]
+    if avg_balance_candidates:
+        features["avg_monthly_balance"] = float(max(avg_balance_candidates))
 
     # Savings / liquid balance — credit_limit from cms_uaa, metadata fallback
     if not features["savings_account_balance"] and max_total_assets:
