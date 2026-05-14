@@ -27,3 +27,6 @@ airflow/data/*.pkg
 # Docker volumes
 pgdata/
 minio_data/
+
+# TLS certs — never commit private keys
+certs/
