@@ -467,7 +467,7 @@ def explain(
 
     shap_model = load_model_for_shap("CreditScorePredictor", tracking_uri)
     if shap_model is not None:
-        explanation_result = explain_prediction(shap_model, features, top_n=5)
+        explanation_result = explain_prediction(shap_model, features, top_n=7)
     else:
         explanation_error = "Model registry unavailable — SHAP explanation skipped."
 

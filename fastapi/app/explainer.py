@@ -34,6 +34,7 @@ def _extract_pipeline_parts(model):
 def explain_prediction(model, features: dict, top_n: int = 5) -> dict:
     """
     Compute SHAP values for a single prediction.
+    Returns at least `top_n` positive (helps) AND `top_n` negative (hurts) drivers.
     Handles both raw sklearn estimators and Pipeline objects.
     Falls back to feature_importances_ if SHAP fails.
     """
@@ -53,7 +54,6 @@ def explain_prediction(model, features: dict, top_n: int = 5) -> dict:
 
         if preprocessor is not None:
             X = preprocessor.transform(df)
-            # Get feature names after transformation if available
             try:
                 transformed_names = preprocessor.get_feature_names_out()
             except Exception:
@@ -74,23 +74,45 @@ def explain_prediction(model, features: dict, top_n: int = 5) -> dict:
             explainer.expected_value, (list, np.ndarray)
         ) else float(explainer.expected_value[1])
 
-        drivers = [
+        # Build all drivers (skip near-zero noise)
+        all_drivers = [
             {
                 "feature": name.split("__")[-1],  # strip pipeline prefix
                 "impact": round(float(val), 4),
+                "value": features.get(name.split("__")[-1]),
                 "direction": "helps_score" if val > 0 else "hurts_score",
             }
             for name, val in zip(transformed_names, values)
-            if abs(val) > 0.001  # skip near-zero contributions
+            if abs(val) > 0.001
         ]
-        drivers.sort(key=lambda x: abs(x["impact"]), reverse=True)
 
-        # Add original input value for top features
-        for d in drivers[:top_n]:
-            raw_name = d["feature"]
-            d["value"] = features.get(raw_name)
+        # helps: highest positive impact first (descending)
+        helps = sorted(
+            [d for d in all_drivers if d["direction"] == "helps_score"],
+            key=lambda x: x["impact"],
+            reverse=True,
+        )[:top_n]
 
-        return {"top_drivers": drivers[:top_n], "base_score": round(base_score, 2), "method": "shap"}
+        # hurts: highest magnitude negative impact first
+        # (most damaging at top → least damaging at bottom)
+        hurts = sorted(
+            [d for d in all_drivers if d["direction"] == "hurts_score"],
+            key=lambda x: abs(x["impact"]),
+            reverse=True,
+        )[:top_n]
+
+        # Combined top drivers (sorted by absolute impact)
+        combined = sorted(
+            helps + hurts, key=lambda x: abs(x["impact"]), reverse=True
+        )
+
+        return {
+            "top_drivers": combined,
+            "top_helps": helps,
+            "top_hurts": hurts,
+            "base_score": round(base_score, 2),
+            "method": "shap",
+        }
 
     except Exception as e:
         logger.warning("SHAP failed, falling back to feature_importances_: %s", e)
@@ -98,6 +120,10 @@ def explain_prediction(model, features: dict, top_n: int = 5) -> dict:
 
 
 def _fallback_importance(estimator, feature_names: list, top_n: int) -> dict:
+    """
+    Fallback when SHAP fails — uses sklearn's global feature_importances_.
+    Note: feature_importances_ are always positive (no direction).
+    """
     try:
         importances = estimator.feature_importances_
         drivers = [
@@ -105,15 +131,28 @@ def _fallback_importance(estimator, feature_names: list, top_n: int) -> dict:
                 "feature": name,
                 "impact": round(float(imp), 4),
                 "value": None,
-                "direction": "helps_score",
+                "direction": "helps_score",  # global importance has no direction
             }
             for name, imp in zip(feature_names, importances)
+            if imp > 0
         ]
         drivers.sort(key=lambda x: x["impact"], reverse=True)
-        return {"top_drivers": drivers[:top_n], "base_score": None, "method": "feature_importance"}
+        return {
+            "top_drivers": drivers[: top_n * 2],
+            "top_helps": drivers[:top_n],
+            "top_hurts": [],
+            "base_score": None,
+            "method": "feature_importance",
+        }
     except Exception as e:
         logger.error("Fallback importance also failed: %s", e)
-        return {"top_drivers": [], "base_score": None, "method": "unavailable"}
+        return {
+            "top_drivers": [],
+            "top_helps": [],
+            "top_hurts": [],
+            "base_score": None,
+            "method": "unavailable",
+        }
 
 
 def summarize_drivers(top_drivers: list) -> str:
@@ -123,7 +162,7 @@ def summarize_drivers(top_drivers: list) -> str:
     helps = [d["feature"] for d in top_drivers if d["direction"] == "helps_score"]
     parts = []
     if hurts:
-        parts.append(f"Score reduced by: {', '.join(hurts[:2])}")
+        parts.append(f"Score reduced by: {', '.join(hurts[:7])}")
     if helps:
-        parts.append(f"Score supported by: {', '.join(helps[:2])}")
+        parts.append(f"Score supported by: {', '.join(helps[:7])}")
     return ". ".join(parts) + "." if parts else "No dominant drivers found."
