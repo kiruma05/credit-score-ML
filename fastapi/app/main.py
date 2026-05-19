@@ -685,16 +685,27 @@ def explain(
 
     # Load model from MLflow registry for SHAP (bypasses serving endpoint)
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow-server:5000")
-    explanation_result = {"top_drivers": [], "base_score": None, "method": "unavailable"}
+    explanation_result = {
+        "method": "unavailable",
+        "base_score": None,
+        "top_helps": [],
+        "top_hurts": [],
+    }
     explanation_error = None
 
     shap_model = load_model_for_shap("CreditScorePredictor", tracking_uri)
     if shap_model is not None:
-        explanation_result = explain_prediction(shap_model, features, top_n=5)
+        # 7 features each side → 14 SHAP-ranked factors per decision
+        explanation_result = explain_prediction(
+            shap_model, features, top_n_helps=7, top_n_hurts=7
+        )
     else:
         explanation_error = "Model registry unavailable — SHAP explanation skipped."
 
-    explanation_result["summary"] = summarize_drivers(explanation_result["top_drivers"])
+    explanation_result["summary"] = summarize_drivers(
+        explanation_result.get("top_helps", []),
+        explanation_result.get("top_hurts", []),
+    )
 
     payload = {
         "customer_id": customer.customer_id,

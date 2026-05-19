@@ -109,7 +109,43 @@ def _map_transformed_to_original(
     return per_original
 
 
-def explain_prediction(model, features: dict, top_n: int = 5) -> dict:
+def _make_driver(name: str, val: float, features: dict) -> dict:
+    return {
+        "feature": name,
+        "impact": round(float(val), 4),
+        "direction": "helps_score" if val > 0 else "hurts_score",
+        "value": features.get(name),
+    }
+
+
+def _split_helps_hurts(
+    per_original: dict,
+    features: dict,
+    top_n_helps: int,
+    top_n_hurts: int,
+    threshold: float = 1e-6,
+) -> tuple:
+    """Split SHAP impacts into two ranked lists.
+
+    top_helps: positive impacts, sorted DESC (biggest positive first)
+    top_hurts: negative impacts, sorted ASC (most negative first)
+    """
+    helps_pairs = sorted(
+        [(n, v) for n, v in per_original.items() if v > threshold],
+        key=lambda x: x[1], reverse=True,
+    )
+    hurts_pairs = sorted(
+        [(n, v) for n, v in per_original.items() if v < -threshold],
+        key=lambda x: x[1],
+    )
+    top_helps = [_make_driver(n, v, features) for n, v in helps_pairs[:top_n_helps]]
+    top_hurts = [_make_driver(n, v, features) for n, v in hurts_pairs[:top_n_hurts]]
+    return top_helps, top_hurts
+
+
+def explain_prediction(
+    model, features: dict, top_n_helps: int = 7, top_n_hurts: int = 7
+) -> dict:
     """Compute SHAP values for a single prediction.
 
     Strategy: transform both the request row AND the background CSV through
@@ -117,6 +153,11 @@ def explain_prediction(model, features: dict, top_n: int = 5) -> dict:
     numeric float64 matrix, then run ``shap.TreeExplainer`` on the inner
     estimator with that matrix. Finally aggregate SHAP values back per
     original feature so explanations are human-readable.
+
+    Returns two ranked lists:
+      - ``top_helps``  — 7 features that pushed the score UP   (DESC by +impact)
+      - ``top_hurts``  — 7 features that pulled the score DOWN (ASC by -impact)
+    Plus ``base_score``, ``method``, ``summary``.
 
     Falls back to ``feature_importances_`` only if SHAP genuinely cannot run.
     """
@@ -133,19 +174,21 @@ def explain_prediction(model, features: dict, top_n: int = 5) -> dict:
             sv = explainer.shap_values(X)
             values = np.asarray(sv).flatten()[: len(feature_names)]
             base = float(explainer.expected_value)
-            contributions = sorted(
-                zip(feature_names, values), key=lambda x: abs(x[1]), reverse=True
+            per_original = dict(zip(feature_names, [float(v) for v in values]))
+            top_helps, top_hurts = _split_helps_hurts(
+                per_original, features, top_n_helps, top_n_hurts
             )
-            drivers = [
-                {"feature": n, "impact": round(float(v), 4),
-                 "direction": "helps_score" if v > 0 else "hurts_score",
-                 "value": features.get(n)}
-                for n, v in contributions[:top_n] if abs(v) > 1e-6
-            ]
-            return {"top_drivers": drivers, "base_score": round(base, 2), "method": "shap"}
+            return {
+                "method": "shap",
+                "base_score": round(base, 2),
+                "top_helps": top_helps,
+                "top_hurts": top_hurts,
+            }
         except Exception as e:
             logger.warning("SHAP (no-preprocessor) failed: %s", e)
-            return _fallback_importance(estimator, feature_names, features, top_n)
+            return _fallback_importance(
+                estimator, feature_names, features, top_n_helps, top_n_hurts
+            )
 
     try:
         import shap
@@ -185,7 +228,6 @@ def explain_prediction(model, features: dict, top_n: int = 5) -> dict:
         per_original = _map_transformed_to_original(
             transformed_names, values, feature_names
         )
-        contributions = sorted(per_original.items(), key=lambda x: abs(x[1]), reverse=True)
 
         expected_value = explainer.expected_value
         if isinstance(expected_value, (list, np.ndarray)):
@@ -193,53 +235,70 @@ def explain_prediction(model, features: dict, top_n: int = 5) -> dict:
         else:
             base = float(expected_value)
 
-        drivers = [
-            {
-                "feature": name,
-                "impact": round(val, 4),
-                "direction": "helps_score" if val > 0 else "hurts_score",
-                "value": features.get(name),
-            }
-            for name, val in contributions[:top_n]
-            if abs(val) > 1e-6
-        ]
-        return {"top_drivers": drivers, "base_score": round(base, 2), "method": "shap"}
+        top_helps, top_hurts = _split_helps_hurts(
+            per_original, features, top_n_helps, top_n_hurts
+        )
+        return {
+            "method": "shap",
+            "base_score": round(base, 2),
+            "top_helps": top_helps,
+            "top_hurts": top_hurts,
+        }
 
     except Exception as e:
         logger.warning("SHAP failed, falling back to feature_importances_: %s", e)
-        return _fallback_importance(estimator, feature_names, features, top_n)
+        return _fallback_importance(
+            estimator, feature_names, features, top_n_helps, top_n_hurts
+        )
 
 
-def _fallback_importance(estimator, feature_names: list, features: dict, top_n: int) -> dict:
+def _fallback_importance(
+    estimator, feature_names: list, features: dict,
+    top_n_helps: int = 7, top_n_hurts: int = 7,
+) -> dict:
+    """Fallback when SHAP fails. feature_importances_ is unsigned — all go to
+    top_helps (ranked by importance); top_hurts stays empty."""
     try:
         importances = estimator.feature_importances_
         # If the importance vector is longer than the raw feature list (due to
         # one-hot encoding inside the pipeline), align by truncation.
         n = min(len(feature_names), len(importances))
-        drivers = [
+        ranked = sorted(
+            [(feature_names[i], float(importances[i])) for i in range(n)],
+            key=lambda x: x[1], reverse=True,
+        )
+        helps = [
             {
-                "feature": feature_names[i],
-                "impact": round(float(importances[i]), 4),
-                "value": features.get(feature_names[i]),
+                "feature": name,
+                "impact": round(val, 4),
+                "value": features.get(name),
                 "direction": "helps_score",
             }
-            for i in range(n)
+            for name, val in ranked[:top_n_helps]
         ]
-        drivers.sort(key=lambda x: x["impact"], reverse=True)
-        return {"top_drivers": drivers[:top_n], "base_score": None, "method": "feature_importance"}
+        return {
+            "method": "feature_importance",
+            "base_score": None,
+            "top_helps": helps,
+            "top_hurts": [],
+        }
     except Exception as e:
         logger.error("Fallback importance also failed: %s", e)
-        return {"top_drivers": [], "base_score": None, "method": "unavailable"}
+        return {
+            "method": "unavailable",
+            "base_score": None,
+            "top_helps": [],
+            "top_hurts": [],
+        }
 
 
-def summarize_drivers(top_drivers: list) -> str:
-    if not top_drivers:
-        return "Explanation unavailable."
-    hurts = [d["feature"] for d in top_drivers if d["direction"] == "hurts_score"]
-    helps = [d["feature"] for d in top_drivers if d["direction"] == "helps_score"]
+def summarize_drivers(top_helps: list, top_hurts: list) -> str:
+    """Plain-English one-liner from the split driver lists."""
     parts = []
-    if hurts:
-        parts.append(f"Score reduced by: {', '.join(hurts[:2])}")
-    if helps:
-        parts.append(f"Score supported by: {', '.join(helps[:2])}")
-    return ". ".join(parts) + "." if parts else "No dominant drivers found."
+    if top_hurts:
+        parts.append(f"Score reduced by: {', '.join(d['feature'] for d in top_hurts[:2])}")
+    if top_helps:
+        parts.append(f"Score supported by: {', '.join(d['feature'] for d in top_helps[:2])}")
+    if not parts:
+        return "No dominant drivers found."
+    return ". ".join(parts) + "."
