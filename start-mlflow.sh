@@ -9,8 +9,14 @@ echo "All required environment variables are set."
 echo "Installing Python dependencies..."
 pip install mlflow==2.9.2 psycopg2-binary boto3
 echo "Starting MLflow server..."
+# --workers 2: lower memory footprint (was 4) — workers were getting SIGKILL'd
+#               OOM on the VM during large artifact downloads.
+# --gunicorn-opts: 300s timeout for slow operations (model downloads from MinIO,
+#                  large SHAP background loads).
 exec mlflow server \
     --host 0.0.0.0 \
     --port 5000 \
     --backend-store-uri "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}" \
-    --default-artifact-root "s3://mlflow/"
+    --default-artifact-root "s3://mlflow/" \
+    --workers 2 \
+    --gunicorn-opts "--timeout 300 --graceful-timeout 60"
