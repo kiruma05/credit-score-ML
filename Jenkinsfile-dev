@@ -30,7 +30,7 @@ pipeline {
         K8S_MANIFEST_REPO_URL       = 'http://192.168.15.85/kubernetes-manifest/softcms/credit-score-ml-engine.git'
         K8S_MANIFEST_CREDENTIALS_ID = 'lsaid'
         K8S_MANIFEST_BRANCH         = 'main'
-        K8S_MANIFEST_PATHS          = 'deployment.yaml'
+        K8S_MANIFEST_PATHS          = '04-deployment.yaml'
 
         // Build Info
         BUILD_TOOL   = 'python'
