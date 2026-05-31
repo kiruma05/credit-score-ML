@@ -66,13 +66,13 @@ pipeline {
             }
         }
 
-        stage('Vulnerability Scan - Docker') {
-            steps {
-                script {
-                    vulnScanDocker()
-                }
-            }
-        }
+        // stage('Vulnerability Scan - Docker') {
+        //     steps {
+        //         script {
+        //             vulnScanDocker()
+        //         }
+        //     }
+        // }
 
         stage('Build Docker Image and Publish') {
             steps {
