@@ -4,4 +4,4 @@ ENV JAVA_HOME /usr/lib/jvm/java-17-openjdk-amd64
 
 USER airflow
 
-RUN pip install apache-airflow apache-airflow-providers-apache-spark mlflow==2.7.1 pyspark==3.3.3
+RUN pip install --resume-retries 10 --timeout 300 apache-airflow apache-airflow-providers-apache-spark mlflow==2.7.1 pyspark==3.3.3
