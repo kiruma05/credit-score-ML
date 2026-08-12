@@ -58,12 +58,18 @@ async def require_api_auth(
 
     # HTTPS enforcement (production only)
     if REQUIRE_HTTPS and request.url.scheme != "https":
-        raise HTTPException(status_code=403, detail="HTTPS is required.")
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "HTTPS_REQUIRED", "message": "HTTPS is required."},
+        )
 
     if not api_key or not api_secret:
         raise HTTPException(
             status_code=401,
-            detail="Missing required headers: api-key and api-secret.",
+            detail={
+                "code": "MISSING_API_CREDENTIALS",
+                "message": "Missing required headers: api-key and api-secret.",
+            },
         )
 
     # Lookup client by key only — never log the secret
@@ -82,13 +88,19 @@ async def require_api_auth(
             api_key[:8] if api_key and len(api_key) > 8 else "***",
             request.url.path,
         )
-        raise HTTPException(status_code=401, detail="Invalid credentials.")
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "INVALID_CREDENTIALS", "message": "Invalid credentials."},
+        )
 
     # Expiry — enforced in production via ENFORCE_KEY_EXPIRY=true
     # In development, expires_at=null means the key never expires
     if ENFORCE_KEY_EXPIRY and client.expires_at is not None:
         if datetime.utcnow() > client.expires_at:
-            raise HTTPException(status_code=403, detail="API key has expired.")
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "API_KEY_EXPIRED", "message": "API key has expired."},
+            )
 
     # Track last usage without blocking the request on failure
     try:

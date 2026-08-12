@@ -1,14 +1,13 @@
 import os
+import subprocess
 import uuid
 import random
 import sys
 from datetime import datetime, date, timedelta
 from urllib.parse import quote_plus
-from fastapi import FastAPI, Depends, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.exceptions import RequestValidationError
-from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session, sessionmaker, joinedload
 from sqlalchemy import create_engine, text
 from pydantic import BaseModel
@@ -28,13 +27,13 @@ from app.fraud.fraud_router import router as fraud_router
 from app.auth import require_api_auth
 from app.auth_router import router as auth_router
 from app.explainer import load_model_for_shap, explain_prediction, summarize_drivers
-from app.response import (
-    success_response,
+from app.features import fetch_features
+from app.middleware import RequestIDMiddleware
+from app.utils.response import (
+    Envelope,
     error_response,
-    http_exception_handler,
-    validation_exception_handler,
-    generic_exception_handler,
-    request_id_middleware,
+    paginated,
+    success_response,
 )
 
 app = FastAPI(
@@ -51,15 +50,52 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-Id"],
 )
+app.add_middleware(RequestIDMiddleware)
 
-# Attach request_id to every request
-app.add_middleware(BaseHTTPMiddleware, dispatch=request_id_middleware)
 
-# Global exception handlers — every error response follows the standard format
-app.add_exception_handler(StarletteHTTPException, http_exception_handler)
-app.add_exception_handler(RequestValidationError, validation_exception_handler)
-app.add_exception_handler(Exception, generic_exception_handler)
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Wrap HTTPException so every error response shares the envelope shape.
+
+    Endpoints can raise either a plain detail string or a structured
+    ``{"code": "...", "message": "...", "details": {...}}`` payload — we unpack
+    the structured form when available.
+    """
+    code = "HTTP_ERROR"
+    message = "Request failed"
+    details = None
+    if isinstance(exc.detail, dict):
+        code = exc.detail.get("code", code)
+        message = exc.detail.get("message", message)
+        details = exc.detail.get("details")
+    elif isinstance(exc.detail, str):
+        message = exc.detail
+    return error_response(code, message, request, details=details, status_code=exc.status_code)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return error_response(
+        code="VALIDATION_ERROR",
+        message="Request validation failed",
+        request=request,
+        details=exc.errors(),
+        status_code=422,
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    print(f"[ERROR] Unhandled exception: {exc}", file=sys.stderr)
+    return error_response(
+        code="INTERNAL_ERROR",
+        message="An unexpected error occurred",
+        request=request,
+        status_code=500,
+    )
+
 
 app.include_router(auth_router, prefix="/auth")
 app.include_router(
@@ -150,6 +186,16 @@ def get_origination_db():
         db.close()
 
 def find_or_create_customer(nida: str, local_db: Session, ext_db) -> models.Customer:
+    """Resolve a customer by NIDA.
+
+    In strict mode (``SCORING_STRICT_MODE=true``) the NIDA MUST exist in
+    cms_uaa — we refuse to create a local stub because doing so would (a)
+    poison local state with a fake customer_id and (b) prevent later resolution
+    if cms_uaa is populated for that NIDA afterwards.
+
+    In demo mode we fall back to a deterministic stub so the seeded synthetic
+    scoring path can still run.
+    """
     customer = local_db.query(models.Customer).filter(models.Customer.nida == nida).first()
     if customer:
         print(f"[INFO] Customer {customer.customer_id} found locally.")
@@ -175,11 +221,31 @@ def find_or_create_customer(nida: str, local_db: Session, ext_db) -> models.Cust
                 details = dict(result._mapping)
                 print(f"[INFO] Customer found in external DB: {details.get('customer_id')}")
             else:
-                print(f"[WARNING] NIDA {nida} not found in external DB. Creating minimal record.")
+                print(f"[WARNING] NIDA {nida} not found in external DB.")
         except Exception as e:
-            print(f"[WARNING] External DB query failed: {e}. Creating minimal record.", file=sys.stderr)
+            print(f"[WARNING] External DB query failed: {e}.", file=sys.stderr)
     else:
-        print(f"[WARNING] External DB unavailable. Creating minimal record for NIDA {nida}.")
+        print(f"[WARNING] External DB unavailable for NIDA {nida}.")
+
+    if not details:
+        if SCORING_STRICT_MODE:
+            print(
+                f"[REJECT] NIDA={nida} not in cms_uaa — refusing to create local stub (strict mode).",
+                flush=True,
+            )
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "CUSTOMER_DATA_MISSING",
+                    "message": "Customer record not found in source systems",
+                    "details": {
+                        "nida": nida,
+                        "checked_sources": ["cms_uaa"],
+                        "hint": "Verify the NIDA exists in user_accounts (cms_uaa), or set SCORING_STRICT_MODE=false for demo mode.",
+                    },
+                },
+            )
+        print(f"[INFO] Demo mode — creating local stub for NIDA {nida}.")
 
     new_customer = models.Customer(
         nida=nida,
@@ -240,84 +306,84 @@ def _invoke_mlflow_server(uri: str, features: dict):
     return None
 
 
-def _get_customer_features(customer: models.Customer, uaa_db, origination_db) -> dict:
+SCORING_STRICT_MODE = os.getenv("SCORING_STRICT_MODE", "true").lower() == "true"
+
+
+def _seed_synthetic_features(features: dict, nida: str) -> None:
+    """Overwrite default features with deterministic, NIDA-seeded values.
+
+    Same NIDA always yields the same features (and therefore the same score),
+    different NIDAs yield different feature vectors. Used only when external
+    customer data is unavailable AND strict mode is disabled.
     """
-    Fetch financial features from cms_uaa (income) and cms_origination (loan history).
-    Falls back to defaults for any unavailable source.
+    rng = random.Random(hash(nida))
+    monthly_income = round(rng.uniform(200, 2000), 2)
+    features.update({
+        "monthly_income": monthly_income,
+        "payment_history_score": rng.randint(300, 750),
+        "credit_history_length_months": rng.randint(6, 60),
+        "active_loans": rng.randint(0, 3),
+        "number_of_late_payments_36": rng.randint(0, 5),
+        "total_outstanding_debt": round(rng.uniform(0, monthly_income * 6), 2),
+        "credit_utilization_ratio": round(rng.uniform(0, 1), 4),
+        "avg_monthly_balance": round(rng.uniform(0, monthly_income * 1.2), 2),
+        "savings_account_balance": round(rng.uniform(0, monthly_income * 3), 2),
+        "requested_amount": rng.randint(500, 5000),
+        "age": rng.randint(21, 65),
+    })
+
+
+def _get_customer_features(customer: models.Customer, uaa_db, origination_db):
+    """Resolve the 22 model features for a customer.
+
+    Thin wrapper over ``features.fetch_features``. Adds strict-mode rejection
+    and the demo-mode seeded fallback that the new module deliberately does
+    not handle (so it remains testable in isolation).
     """
-    features = {
-        "age": 35, "married": "NO", "education": "Graduate", "dependents": 0,
-        "employment_status": "Employed", "spouse_employment_status": "Unemployed",
-        "monthly_income": round(random.uniform(200, 2000), 2),
-        "residense_status": "Rented", "vehicle_ownership_status": "NO",
-        "vehicle_cat": "None", "credit_history_length_months": 12,
-        "payment_history_score": 500, "total_outstanding_debt": 0,
-        "credit_utilization_ratio": 0.0, "number_of_late_payments_36": 0,
-        "active_loans": 0, "avg_monthly_balance": 0, "savings_account_balance": 0,
-        "requested_amount": 1000, "loan_purpose": "Personal",
-        "previous_collateral_value": 0, "debt_to_income_ratio": 0.0,
-    }
+    feats, data_quality = fetch_features(customer.nida, uaa_db, origination_db)
 
-    # --- cms_uaa: income, age, credit_limit ---
-    if uaa_db is not None:
-        try:
-            q = text("""
-                SELECT
-                    CASE WHEN date_of_birth IS NOT NULL AND date_of_birth != ''
-                         THEN DATE_PART('year', AGE(date_of_birth::date))::int
-                         ELSE 35 END                            AS age,
-                    COALESCE(monthly_income, annual_income / 12, 500)::float  AS monthly_income,
-                    COALESCE(annual_income, 0)::float                         AS annual_income,
-                    COALESCE(credit_limit, 0)::float                          AS savings_account_balance
-                FROM user_accounts
-                WHERE uuid = :cid AND deleted = false
-                LIMIT 1
-            """)
-            result = uaa_db.execute(q, {"cid": customer.customer_id}).first()
-            if result:
-                features.update({k: v for k, v in dict(result._mapping).items() if v is not None})
-        except Exception as e:
-            print(f"[WARNING] UAA features query failed: {e}", file=sys.stderr)
+    if data_quality["uaa_source"] == "fallback":
+        if SCORING_STRICT_MODE:
+            print(
+                f"[REJECT] NIDA={customer.nida} customer_id={customer.customer_id} "
+                f"not found in cms_uaa — refusing to score (strict mode).",
+                flush=True,
+            )
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "CUSTOMER_DATA_MISSING",
+                    "message": "Customer record not found in source systems",
+                    "details": {
+                        "nida": customer.nida,
+                        "customer_id": customer.customer_id,
+                        "checked_sources": ["cms_uaa", "cms_origination"],
+                        "hint": "Verify the NIDA exists in user_accounts, or set SCORING_STRICT_MODE=false for demo mode.",
+                    },
+                },
+            )
+        print(
+            f"[FALLBACK] NIDA={customer.nida} customer_id={customer.customer_id} "
+            f"→ seeded synthetic features (demo mode).",
+            flush=True,
+        )
+        _seed_synthetic_features(feats, customer.nida)
+    elif data_quality["score_basis"] != "live_data":
+        print(
+            f"[PARTIAL] NIDA={customer.nida} customer_id={customer.customer_id} "
+            f"score_basis={data_quality['score_basis']} apps={data_quality['applications_found']} "
+            f"employment={data_quality['employment_found']}.",
+            flush=True,
+        )
 
-    # --- cms_origination: loan history, employment, collateral ---
-    if origination_db is not None:
-        try:
-            q = text("""
-                SELECT
-                    COALESCE(ep.employment_type, 'Employed')                         AS employment_status,
-                    COALESCE(ep.gross_salary_monthly, 0)::float                      AS avg_monthly_balance,
-                    COALESCE(ep.duration_years * 12, 12)                             AS credit_history_length_months,
-                    COUNT(DISTINCT la.application_id)
-                        FILTER (WHERE la.status NOT IN ('REJECTED','CANCELLED'))     AS active_loans,
-                    COALESCE(SUM(la.requested_amount)
-                        FILTER (WHERE la.status NOT IN ('REJECTED','CANCELLED')), 0) AS total_outstanding_debt,
-                    COALESCE(MAX(la.requested_amount), 1000)                         AS requested_amount,
-                    COALESCE(MAX(la.loan_purpose), 'Personal')                       AS loan_purpose,
-                    COALESCE(MAX(ci.estimated_value), 0)                             AS previous_collateral_value
-                FROM loan_application la
-                LEFT JOIN employment_profile ep ON ep.application_id = la.application_id
-                LEFT JOIN collateral_item ci    ON ci.application_id = la.application_id
-                WHERE la.borrower_party_id = :cid
-                GROUP BY ep.employment_type, ep.gross_salary_monthly, ep.duration_years
-                LIMIT 1
-            """)
-            result = origination_db.execute(q, {"cid": customer.customer_id}).first()
-            if result:
-                features.update({k: v for k, v in dict(result._mapping).items() if v is not None})
-        except Exception as e:
-            print(f"[WARNING] Origination features query failed: {e}", file=sys.stderr)
-
-    monthly = float(features["monthly_income"])
-    debt = float(features["total_outstanding_debt"])
-    features["debt_to_income_ratio"] = round(debt / monthly, 4) if monthly > 0 else 0.0
-    return features
+    return feats, data_quality
 
 
 def _build_credit_inference(features: dict) -> dict:
-    """
-    Call the 3 credit model servers. Falls back to random score for any unreachable server.
-    """
+    """Call the 3 credit model servers + apply business-rule guard rails."""
     monthly_income = float(features.get("monthly_income", random.uniform(200, 2000)))
+    dti = float(features.get("debt_to_income_ratio", 0.0))
+    active_loans = int(features.get("active_loans", 0))
 
     raw_score = _invoke_mlflow_server(CREDIT_SCORE_URI, features)
     raw_risk = _invoke_mlflow_server(CREDIT_RISK_URI, features)
@@ -325,7 +391,7 @@ def _build_credit_inference(features: dict) -> dict:
 
     credit_score = float(raw_score) if raw_score is not None else float(random.randint(300, 850))
     decision, risk_category, risk_probability, limit_usd, interest_rate, validity_days = \
-        services.apply_business_rules(credit_score, monthly_income)
+        services.apply_business_rules(credit_score, monthly_income, dti, active_loans)
 
     return {
         "credit_score": credit_score,
@@ -338,18 +404,155 @@ def _build_credit_inference(features: dict) -> dict:
     }
 
 
-@app.get("/")
+@app.get("/", response_model=Envelope[dict])
 def root(http_request: Request):
     return success_response(
-        message="Welcome to Credit Scoring & Fraud Detection API",
-        request_id=http_request.state.request_id,
-        data={"service": "credit-score-engine", "version": app.version},
+        data={"service": "Credit Scoring & Fraud Detection API", "version": app.version},
+        message="Welcome to Credit Scoring & Fraud Detection API!",
+        request=http_request,
+    )
+
+
+@app.get("/health", response_model=Envelope[dict], tags=["System"])
+def health(http_request: Request):
+    """Liveness + dependency probe.
+
+    Returns the connectivity status of every upstream the scoring path relies
+    on (postgres, cms_uaa, cms_origination, MLflow). Use this to verify your
+    .env values before calling /predict.
+    """
+    checks = {
+        "postgres": "unknown",
+        "cms_uaa": "unknown",
+        "cms_origination": "unknown",
+        "mlflow_tracking": "unknown",
+        "strict_mode": str(SCORING_STRICT_MODE).lower(),
+    }
+
+    # Local PostgreSQL (where customer/loan state lives)
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        checks["postgres"] = "ok"
+    except Exception as e:
+        checks["postgres"] = f"error: {type(e).__name__}"
+
+    # cms_uaa
+    if ExternalSessionLocal is None:
+        checks["cms_uaa"] = "not_configured"
+    else:
+        try:
+            db = ExternalSessionLocal()
+            db.execute(text("SELECT 1"))
+            db.close()
+            checks["cms_uaa"] = "ok"
+        except Exception as e:
+            checks["cms_uaa"] = f"error: {type(e).__name__}"
+
+    # cms_origination
+    if OriginationSessionLocal is None:
+        checks["cms_origination"] = "not_configured"
+    else:
+        try:
+            db = OriginationSessionLocal()
+            db.execute(text("SELECT 1"))
+            db.close()
+            checks["cms_origination"] = "ok"
+        except Exception as e:
+            checks["cms_origination"] = f"error: {type(e).__name__}"
+
+    # MLflow tracking
+    tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "")
+    if not tracking_uri:
+        checks["mlflow_tracking"] = "not_configured"
+    else:
+        try:
+            r = requests.get(f"{tracking_uri}/health", timeout=3)
+            checks["mlflow_tracking"] = "ok" if r.status_code == 200 else f"http_{r.status_code}"
+        except Exception as e:
+            checks["mlflow_tracking"] = f"error: {type(e).__name__}"
+
+    everything_ok = all(
+        v == "ok" or v == "not_configured" or v.startswith("true") or v.startswith("false")
+        for v in checks.values()
+    )
+    return success_response(
+        data=checks,
+        message="All checks passed" if everything_ok else "One or more dependencies are unhealthy",
+        request=http_request,
+        status_code=200 if everything_ok else 503,
+    )
+
+
+# ─── Admin ────────────────────────────────────────────────────────────────────
+
+_TRAIN_SCRIPT_CANDIDATES = (
+    "/app/airflow_jobs/train_models_pandas.py",  # mounted via docker-compose
+    "/opt/airflow/jobs/train_models_pandas.py",  # alternate mount
+)
+
+
+@app.post("/admin/retrain", response_model=Envelope[dict], tags=["Admin"])
+def admin_retrain(
+    http_request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """Trigger an asynchronous retrain of all 3 credit models.
+
+    The training script runs as a background subprocess and writes to MLflow
+    on completion. Returns immediately with the PID so callers can poll
+    MLflow / inspect logs separately.
+    """
+    admin_token = os.getenv("ADMIN_TOKEN", "")
+    if not admin_token:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "ADMIN_TOKEN_NOT_CONFIGURED",
+                    "message": "Admin token not configured on server."},
+        )
+    if not authorization or authorization != f"Bearer {admin_token}":
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "ADMIN_AUTH_FAILED",
+                    "message": "Invalid or missing admin token."},
+        )
+
+    script = next((p for p in _TRAIN_SCRIPT_CANDIDATES if os.path.exists(p)), None)
+    if script is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "TRAIN_SCRIPT_NOT_MOUNTED",
+                    "message": "Training script not found in container.",
+                    "details": {"checked": list(_TRAIN_SCRIPT_CANDIDATES)}},
+        )
+
+    env = os.environ.copy()
+    env.setdefault("MLFLOW_TRACKING_URI", os.getenv("MLFLOW_TRACKING_URI", "http://mlflow-server:5000"))
+    log_path = f"/tmp/retrain-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.log"
+    proc = subprocess.Popen(
+        ["python", script],
+        env=env,
+        stdout=open(log_path, "w"),
+        stderr=subprocess.STDOUT,
+    )
+    print(f"[INFO] Retraining started: pid={proc.pid} script={script} log={log_path}", flush=True)
+    return success_response(
+        data={
+            "job_id": proc.pid,
+            "status": "started",
+            "script": script,
+            "log_path": log_path,
+            "hint": "Watch MLflow UI for new model versions; promote to Production manually when ready.",
+        },
+        message="Retraining triggered",
+        request=http_request,
+        status_code=202,
     )
 
 
 # ─── Credit Scoring ───────────────────────────────────────────────────────────
 
-@app.post("/predict", tags=["Credit Scoring"])
+@app.post("/predict", response_model=Envelope[models.PredictionResponse], tags=["Credit Scoring"])
 def predict(
     request: models.PredictionRequest,
     http_request: Request,
@@ -375,6 +578,8 @@ def predict(
         .first()
     )
 
+    data_quality = None
+
     if cached:
         print(f"[INFO] Returning cached inference for customer {customer.customer_id}")
         inference = {
@@ -387,28 +592,42 @@ def predict(
             "validity_period_days": cached.validity_period_days,
             "model_version": cached.model_version,
         }
+        # Anything in the cache is live data (we never persist fallback scores).
+        data_quality = {
+            "uaa_source": "live",
+            "origination_source": "live",
+            "score_basis": "live_data_cached",
+        }
     else:
-        features = _get_customer_features(customer, ext_db, origination_db)
+        features, data_quality = _get_customer_features(customer, ext_db, origination_db)
         inference = _build_credit_inference(features)
         model_version = get_production_model_version("CreditScorePredictor")
         inference["model_version"] = model_version
 
-        new_inference = models.CachedInference(
-            customer_id=customer.customer_id,
-            credit_score=inference["credit_score"],
-            decision=inference["decision"],
-            recommended_credit_limit=inference["recommended_credit_limit"],
-            suggested_interest_rate=inference["suggested_interest_rate"],
-            risk_category=inference["risk_category"],
-            risk_probability=inference["risk_probability"],
-            validity_period_days=inference["validity_period_days"],
-            last_inference_date=today,
-            end_inference_date=today + timedelta(days=inference["validity_period_days"]),
-            model_version=model_version,
-        )
-        local_db.add(new_inference)
-        local_db.commit()
-        print(f"[INFO] New inference created for customer {customer.customer_id}")
+        # Only cache scores grounded in live data — fallback scores must re-run
+        # on every call so the moment real cms_uaa data lands, scoring refreshes.
+        if data_quality["score_basis"] == "live_data":
+            new_inference = models.CachedInference(
+                customer_id=customer.customer_id,
+                credit_score=inference["credit_score"],
+                decision=inference["decision"],
+                recommended_credit_limit=inference["recommended_credit_limit"],
+                suggested_interest_rate=inference["suggested_interest_rate"],
+                risk_category=inference["risk_category"],
+                risk_probability=inference["risk_probability"],
+                validity_period_days=inference["validity_period_days"],
+                last_inference_date=today,
+                end_inference_date=today + timedelta(days=inference["validity_period_days"]),
+                model_version=model_version,
+            )
+            local_db.add(new_inference)
+            local_db.commit()
+            print(f"[INFO] New inference cached for customer {customer.customer_id}")
+        else:
+            print(
+                f"[INFO] Inference for {customer.customer_id} not cached "
+                f"(score_basis={data_quality['score_basis']})."
+            )
 
     active_loans = (
         local_db.query(models.Loan)
@@ -422,27 +641,31 @@ def predict(
     credit_limit = float(inference["recommended_credit_limit"]) * USD_TO_TZS_RATE
     spending_limit = max(0.0, credit_limit - outstanding)
 
-    return success_response(
-        message="Credit assessment completed successfully",
+    prediction = models.PredictionResponse(
+        customer_id=customer.customer_id,
         request_id=http_request.state.request_id,
-        data={
-            "customer_id": customer.customer_id,
-            "credit_score": inference["credit_score"],
-            "risk_category": inference["risk_category"],
-            "risk_probability": inference["risk_probability"],
-            "decision": inference["decision"],
-            "recommended_credit_limit": credit_limit,
-            "currency": "TZS",
-            "spending_limit": spending_limit,
-            "outstanding_balance": outstanding,
-            "suggested_interest_rate": inference["suggested_interest_rate"],
-            "validity_period": f"{inference['validity_period_days']} days",
-            "model_version": inference["model_version"],
-        },
+        timestamp=datetime.utcnow().isoformat(),
+        credit_score=inference["credit_score"],
+        risk_category=inference["risk_category"],
+        risk_probability=inference["risk_probability"],
+        decision=inference["decision"],
+        recommended_credit_limit=credit_limit,
+        currency="TZS",
+        spending_limit=spending_limit,
+        outstanding_balance=outstanding,
+        suggested_interest_rate=inference["suggested_interest_rate"],
+        validity_period=f"{inference['validity_period_days']} days",
+        model_version=inference["model_version"],
+        data_quality=data_quality,
+    )
+    return success_response(
+        data=prediction,
+        message="Credit assessment completed",
+        request=http_request,
     )
 
 
-@app.post("/explain", tags=["Credit Scoring"])
+@app.post("/explain", response_model=Envelope[dict], tags=["Credit Scoring"])
 def explain(
     request: models.PredictionRequest,
     http_request: Request,
@@ -456,43 +679,58 @@ def explain(
     Shows which features drove the credit score up or down for this customer.
     """
     customer = find_or_create_customer(request.nida, local_db, ext_db)
-    features = _get_customer_features(customer, ext_db, origination_db)
+    features, data_quality = _get_customer_features(customer, ext_db, origination_db)
     inference = _build_credit_inference(features)
     model_version = get_production_model_version("CreditScorePredictor")
 
     # Load model from MLflow registry for SHAP (bypasses serving endpoint)
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow-server:5000")
-    explanation_result = {"top_drivers": [], "base_score": None, "method": "unavailable"}
+    explanation_result = {
+        "method": "unavailable",
+        "base_score": None,
+        "top_helps": [],
+        "top_hurts": [],
+    }
     explanation_error = None
 
     shap_model = load_model_for_shap("CreditScorePredictor", tracking_uri)
     if shap_model is not None:
-        explanation_result = explain_prediction(shap_model, features, top_n=7)
+        # 7 features each side → 14 SHAP-ranked factors per decision
+        explanation_result = explain_prediction(
+            shap_model, features, top_n_helps=7, top_n_hurts=7
+        )
     else:
         explanation_error = "Model registry unavailable — SHAP explanation skipped."
 
-    explanation_result["summary"] = summarize_drivers(explanation_result["top_drivers"])
+    explanation_result["summary"] = summarize_drivers(
+        explanation_result.get("top_helps", []),
+        explanation_result.get("top_hurts", []),
+    )
 
+    payload = {
+        "customer_id": customer.customer_id,
+        "request_id": http_request.state.request_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "credit_score": inference["credit_score"],
+        "risk_category": inference["risk_category"],
+        "risk_probability": inference["risk_probability"],
+        "decision": inference["decision"],
+        "recommended_credit_limit": inference["recommended_credit_limit"],
+        "suggested_interest_rate": inference["suggested_interest_rate"],
+        "validity_period": f"{inference['validity_period_days']} days",
+        "model_version": model_version,
+        "data_quality": data_quality,
+        "explanation": explanation_result if not explanation_error else None,
+        "explanation_error": explanation_error,
+    }
     return success_response(
-        message="Credit score explanation generated",
-        request_id=http_request.state.request_id,
-        data={
-            "customer_id": customer.customer_id,
-            "credit_score": inference["credit_score"],
-            "risk_category": inference["risk_category"],
-            "risk_probability": inference["risk_probability"],
-            "decision": inference["decision"],
-            "recommended_credit_limit": inference["recommended_credit_limit"],
-            "suggested_interest_rate": inference["suggested_interest_rate"],
-            "validity_period": f"{inference['validity_period_days']} days",
-            "model_version": model_version,
-            "explanation": explanation_result if not explanation_error else None,
-            "explanation_error": explanation_error,
-        },
+        data=payload,
+        message="Credit assessment with SHAP explanation completed",
+        request=http_request,
     )
 
 
-@app.get("/status/{customer_id}", tags=["Credit Scoring"])
+@app.get("/status/{customer_id}", response_model=Envelope[models.StatusResponse], tags=["Credit Scoring"])
 def status(
     customer_id: str,
     http_request: Request,
@@ -504,7 +742,14 @@ def status(
         models.Customer.customer_id == customer_id
     ).first()
     if not customer:
-        raise HTTPException(status_code=404, detail=f"Customer {customer_id} not found.")
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "CUSTOMER_NOT_FOUND",
+                "message": f"Customer {customer_id} not found.",
+                "details": {"customer_id": customer_id},
+            },
+        )
 
     today = date.today()
     inference = (
@@ -539,30 +784,34 @@ def status(
         }
 
     return success_response(
+        data=models.StatusResponse(
+            message="Customer status retrieved.",
+            status="FOUND",
+            detail={
+                "customer_id": customer.customer_id,
+                "name": f"{customer.first_name} {customer.surname}",
+                "outstanding_balance": outstanding,
+                "active_loan_count": len(active_loans),
+                "active_loans": [
+                    {
+                        "loan_ref": loan.loan_ref,
+                        "disbursed_amount": float(loan.disbursed_amount),
+                        "outstanding_balance": float(loan.outstanding_balance),
+                        "disbursal_date": loan.disbursal_date.isoformat() if loan.disbursal_date else None,
+                    }
+                    for loan in active_loans
+                ],
+                "credit_assessment": credit_info,
+            },
+        ),
         message="Customer status retrieved",
-        request_id=http_request.state.request_id,
-        data={
-            "customer_id": customer.customer_id,
-            "name": f"{customer.first_name} {customer.surname}",
-            "outstanding_balance": outstanding,
-            "active_loan_count": len(active_loans),
-            "active_loans": [
-                {
-                    "loan_ref": loan.loan_ref,
-                    "disbursed_amount": float(loan.disbursed_amount),
-                    "outstanding_balance": float(loan.outstanding_balance),
-                    "disbursal_date": loan.disbursal_date.isoformat() if loan.disbursal_date else None,
-                }
-                for loan in active_loans
-            ],
-            "credit_assessment": credit_info,
-        },
+        request=http_request,
     )
 
 
 # ─── Loan Management ──────────────────────────────────────────────────────────
 
-@app.post("/disburse", tags=["Loan Management"])
+@app.post("/disburse", response_model=Envelope[models.StatusResponse], tags=["Loan Management"])
 def disburse(
     request: models.DisburseRequest,
     http_request: Request,
@@ -574,10 +823,24 @@ def disburse(
         models.Customer.customer_id == request.customer_id
     ).first()
     if not customer:
-        raise HTTPException(status_code=404, detail=f"Customer {request.customer_id} not found.")
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "CUSTOMER_NOT_FOUND",
+                "message": f"Customer {request.customer_id} not found.",
+                "details": {"customer_id": request.customer_id},
+            },
+        )
 
     if local_db.query(models.Loan).filter(models.Loan.loan_ref == request.loan_ref).first():
-        raise HTTPException(status_code=409, detail=f"Loan reference {request.loan_ref} already exists.")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "LOAN_REF_CONFLICT",
+                "message": f"Loan reference {request.loan_ref} already exists.",
+                "details": {"loan_ref": request.loan_ref},
+            },
+        )
 
     today = date.today()
     inference = (
@@ -593,7 +856,10 @@ def disburse(
     if not inference:
         raise HTTPException(
             status_code=403,
-            detail="No valid approved credit assessment found. Run /predict first.",
+            detail={
+                "code": "NO_VALID_ASSESSMENT",
+                "message": "No valid approved credit assessment found. Run /predict first.",
+            },
         )
 
     active_loans = (
@@ -605,11 +871,18 @@ def disburse(
     available = float(inference.recommended_credit_limit) * USD_TO_TZS_RATE - outstanding
 
     if request.amount <= 0:
-        raise HTTPException(status_code=400, detail="Disbursement amount must be positive.")
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_AMOUNT", "message": "Disbursement amount must be positive."},
+        )
     if request.amount > available:
         raise HTTPException(
             status_code=403,
-            detail=f"Requested {request.amount} exceeds available limit {round(available, 2)}.",
+            detail={
+                "code": "LIMIT_EXCEEDED",
+                "message": f"Requested {request.amount} exceeds available limit {round(available, 2)}.",
+                "details": {"requested": request.amount, "available": round(available, 2)},
+            },
         )
 
     loan = models.Loan(
@@ -626,20 +899,24 @@ def disburse(
     local_db.refresh(loan)
 
     return success_response(
+        data=models.StatusResponse(
+            message="Loan disbursed successfully.",
+            status="ACTIVE",
+            detail={
+                "loan_ref": loan.loan_ref,
+                "customer_id": loan.customer_id,
+                "disbursed_amount": float(loan.disbursed_amount),
+                "outstanding_balance": float(loan.outstanding_balance),
+                "disbursal_date": loan.disbursal_date.isoformat(),
+            },
+        ),
         message="Loan disbursed successfully",
-        request_id=http_request.state.request_id,
-        data={
-            "loan_ref": loan.loan_ref,
-            "customer_id": loan.customer_id,
-            "disbursed_amount": float(loan.disbursed_amount),
-            "outstanding_balance": float(loan.outstanding_balance),
-            "disbursal_date": loan.disbursal_date.isoformat(),
-            "status": "ACTIVE",
-        },
+        request=http_request,
+        status_code=201,
     )
 
 
-@app.post("/repay", tags=["Loan Management"])
+@app.post("/repay", response_model=Envelope[models.StatusResponse], tags=["Loan Management"])
 def repay(
     request: models.RepayRequest,
     http_request: Request,
@@ -656,11 +933,28 @@ def repay(
         .first()
     )
     if not loan:
-        raise HTTPException(status_code=404, detail=f"Loan {request.loan_ref} not found for this customer.")
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "LOAN_NOT_FOUND",
+                "message": f"Loan {request.loan_ref} not found for this customer.",
+                "details": {"loan_ref": request.loan_ref, "customer_id": request.customer_id},
+            },
+        )
     if loan.status == "SETTLED":
-        raise HTTPException(status_code=400, detail=f"Loan {request.loan_ref} is already fully settled.")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "LOAN_ALREADY_SETTLED",
+                "message": f"Loan {request.loan_ref} is already fully settled.",
+                "details": {"loan_ref": request.loan_ref},
+            },
+        )
     if request.amount <= 0:
-        raise HTTPException(status_code=400, detail="Repayment amount must be positive.")
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_AMOUNT", "message": "Repayment amount must be positive."},
+        )
 
     local_db.add(models.Repayment(
         loan_ref=request.loan_ref,
@@ -677,12 +971,16 @@ def repay(
     local_db.refresh(loan)
 
     return success_response(
+        data=models.StatusResponse(
+            message="Repayment recorded successfully.",
+            status=loan.status,
+            detail={
+                "loan_ref": loan.loan_ref,
+                "repayment_amount": request.amount,
+                "outstanding_balance": float(loan.outstanding_balance),
+                "loan_status": loan.status,
+            },
+        ),
         message="Repayment recorded successfully",
-        request_id=http_request.state.request_id,
-        data={
-            "loan_ref": loan.loan_ref,
-            "repayment_amount": request.amount,
-            "outstanding_balance": float(loan.outstanding_balance),
-            "loan_status": loan.status,
-        },
+        request=http_request,
     )

@@ -1,8 +1,26 @@
+"""SHAP-based explainability for the credit scoring model.
+
+Uses the model-agnostic ``shap.Explainer(model.predict, background)`` API so
+it works on any sklearn pipeline regardless of preprocessor / estimator type
+— no more dtype, sparse-matrix or ColumnTransformer pitfalls. Background
+samples are drawn once from the training CSV and cached on the module.
+"""
+from __future__ import annotations
+
 import logging
+import os
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+_BACKGROUND: Optional[pd.DataFrame] = None
+_BACKGROUND_PATHS = (
+    "/app/data/customer_data.csv",          # mounted via docker-compose
+    "/opt/airflow/data/customer_data.csv",  # alternate mount
+)
 
 
 def load_model_for_shap(model_name: str, tracking_uri: str):
@@ -17,152 +35,270 @@ def load_model_for_shap(model_name: str, tracking_uri: str):
 
 
 def _extract_pipeline_parts(model):
-    """Extract preprocessor and final estimator from a sklearn Pipeline."""
+    """Return ``(preprocessor, estimator)`` for a sklearn Pipeline, else ``(None, model)``."""
     from sklearn.pipeline import Pipeline
     if isinstance(model, Pipeline):
         steps = model.named_steps
         step_names = list(steps.keys())
         final_estimator = steps[step_names[-1]]
-        if len(step_names) > 1:
-            preprocessor = model[:-1]  # all steps except the last
-        else:
-            preprocessor = None
+        preprocessor = model[:-1] if len(step_names) > 1 else None
         return preprocessor, final_estimator
     return None, model
 
 
-def explain_prediction(model, features: dict, top_n: int = 5) -> dict:
+def _load_background(n: int = 50, columns: Optional[list] = None) -> Optional[pd.DataFrame]:
+    """Load (and cache) a small background sample for SHAP expected-value baseline."""
+    global _BACKGROUND
+    if _BACKGROUND is not None:
+        if columns is not None:
+            # Reindex to match the requested column order on every call
+            return _BACKGROUND.reindex(columns=columns, fill_value=0)
+        return _BACKGROUND
+
+    for path in _BACKGROUND_PATHS:
+        if not os.path.exists(path):
+            continue
+        try:
+            df = pd.read_csv(path)
+            drop_cols = [c for c in (
+                "customer_id", "nida",
+                "risk_category_target", "is_approved", "is_fraud", "is_high_risk",
+                "payment_history_score",  # this is the model target, not an input
+            ) if c in df.columns]
+            df = df.drop(columns=drop_cols)
+            _BACKGROUND = df.sample(n=min(n, len(df)), random_state=42).reset_index(drop=True)
+            logger.info("SHAP background loaded from %s (%d rows)", path, len(_BACKGROUND))
+            if columns is not None:
+                return _BACKGROUND.reindex(columns=columns, fill_value=0)
+            return _BACKGROUND
+        except Exception as e:
+            logger.warning("Failed to load SHAP background from %s: %s", path, e)
+
+    logger.warning("SHAP background CSV not found in any expected location.")
+    return None
+
+
+def _normalize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """Force object columns to str, numeric to float — matches training prep."""
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].fillna("None").astype(str)
+        else:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    return df
+
+
+def _map_transformed_to_original(
+    transformed_names: list, values: np.ndarray, original_columns: list
+) -> dict:
+    """Sum SHAP values back per original column (one-hot expands to many cols)."""
+    per_original = {col: 0.0 for col in original_columns}
+    for tname, val in zip(transformed_names, values):
+        # transformed names look like "num__monthly_income" or "cat__employment_status_EMPLOYED"
+        after = tname.split("__", 1)[-1]
+        # Find which original column owns this transformed feature
+        owner = None
+        for col in original_columns:
+            if after == col or after.startswith(col + "_"):
+                owner = col
+                break
+        if owner is None:
+            owner = after  # last-resort: keep transformed name
+            per_original.setdefault(owner, 0.0)
+        per_original[owner] += float(val)
+    return per_original
+
+
+def _make_driver(name: str, val: float, features: dict) -> dict:
+    return {
+        "feature": name,
+        "impact": round(float(val), 4),
+        "direction": "helps_score" if val > 0 else "hurts_score",
+        "value": features.get(name),
+    }
+
+
+def _split_helps_hurts(
+    per_original: dict,
+    features: dict,
+    top_n_helps: int,
+    top_n_hurts: int,
+    threshold: float = 1e-6,
+) -> tuple:
+    """Split SHAP impacts into two ranked lists.
+
+    top_helps: positive impacts, sorted DESC (biggest positive first)
+    top_hurts: negative impacts, sorted ASC (most negative first)
     """
-    Compute SHAP values for a single prediction.
-    Returns at least `top_n` positive (helps) AND `top_n` negative (hurts) drivers.
-    Handles both raw sklearn estimators and Pipeline objects.
-    Falls back to feature_importances_ if SHAP fails.
+    helps_pairs = sorted(
+        [(n, v) for n, v in per_original.items() if v > threshold],
+        key=lambda x: x[1], reverse=True,
+    )
+    hurts_pairs = sorted(
+        [(n, v) for n, v in per_original.items() if v < -threshold],
+        key=lambda x: x[1],
+    )
+    top_helps = [_make_driver(n, v, features) for n, v in helps_pairs[:top_n_helps]]
+    top_hurts = [_make_driver(n, v, features) for n, v in hurts_pairs[:top_n_hurts]]
+    return top_helps, top_hurts
+
+
+def explain_prediction(
+    model, features: dict, top_n_helps: int = 7, top_n_hurts: int = 7
+) -> dict:
+    """Compute SHAP values for a single prediction.
+
+    Strategy: transform both the request row AND the background CSV through
+    the pipeline's preprocessor (StandardScaler + OneHotEncoder) to a fully
+    numeric float64 matrix, then run ``shap.TreeExplainer`` on the inner
+    estimator with that matrix. Finally aggregate SHAP values back per
+    original feature so explanations are human-readable.
+
+    Returns two ranked lists:
+      - ``top_helps``  — 7 features that pushed the score UP   (DESC by +impact)
+      - ``top_hurts``  — 7 features that pulled the score DOWN (ASC by -impact)
+    Plus ``base_score``, ``method``, ``summary``.
+
+    Falls back to ``feature_importances_`` only if SHAP genuinely cannot run.
     """
     feature_names = list(features.keys())
-    df = pd.DataFrame([features])
-
-    for col in df.columns:
-        try:
-            df[col] = df[col].astype(float)
-        except (ValueError, TypeError):
-            df[col] = 0.0
+    df = _normalize_dtypes(pd.DataFrame([features]))
 
     preprocessor, estimator = _extract_pipeline_parts(model)
+    if preprocessor is None:
+        # No preprocessing — try TreeExplainer directly on numeric values.
+        try:
+            import shap
+            X = np.asarray(df.values, dtype=np.float64)
+            explainer = shap.TreeExplainer(estimator)
+            sv = explainer.shap_values(X)
+            values = np.asarray(sv).flatten()[: len(feature_names)]
+            base = float(explainer.expected_value)
+            per_original = dict(zip(feature_names, [float(v) for v in values]))
+            top_helps, top_hurts = _split_helps_hurts(
+                per_original, features, top_n_helps, top_n_hurts
+            )
+            return {
+                "method": "shap",
+                "base_score": round(base, 2),
+                "top_helps": top_helps,
+                "top_hurts": top_hurts,
+            }
+        except Exception as e:
+            logger.warning("SHAP (no-preprocessor) failed: %s", e)
+            return _fallback_importance(
+                estimator, feature_names, features, top_n_helps, top_n_hurts
+            )
 
     try:
         import shap
 
-        if preprocessor is not None:
-            X = preprocessor.transform(df)
-            try:
-                transformed_names = preprocessor.get_feature_names_out()
-            except Exception:
-                transformed_names = [f"feature_{i}" for i in range(X.shape[1])]
-        else:
-            X = df.values
-            transformed_names = feature_names
+        bg = _load_background(columns=df.columns.tolist())
+        if bg is None or len(bg) == 0:
+            raise RuntimeError("SHAP background dataset unavailable")
+        bg = _normalize_dtypes(bg.copy())
 
-        explainer = shap.TreeExplainer(estimator)
-        shap_values = explainer.shap_values(X)
+        # Transform both through the pipeline preprocessor → numeric float64.
+        bg_X = preprocessor.transform(bg)
+        if hasattr(bg_X, "toarray"):
+            bg_X = bg_X.toarray()
+        bg_X = np.asarray(bg_X, dtype=np.float64)
 
+        input_X = preprocessor.transform(df)
+        if hasattr(input_X, "toarray"):
+            input_X = input_X.toarray()
+        input_X = np.asarray(input_X, dtype=np.float64)
+
+        # TreeExplainer with background → proper expected_value baseline.
+        explainer = shap.TreeExplainer(
+            estimator, bg_X, feature_perturbation="interventional"
+        )
+        shap_values = explainer.shap_values(input_X)
         if isinstance(shap_values, list):
-            values = shap_values[1][0]
+            values = shap_values[0][0] if shap_values[0].ndim == 2 else shap_values[0]
         else:
-            values = shap_values[0]
+            values = shap_values[0] if shap_values.ndim == 2 else shap_values
 
-        base_score = float(explainer.expected_value) if not isinstance(
-            explainer.expected_value, (list, np.ndarray)
-        ) else float(explainer.expected_value[1])
+        try:
+            transformed_names = list(preprocessor.get_feature_names_out())
+        except Exception:
+            transformed_names = [f"feature_{i}" for i in range(len(values))]
 
-        # Build all drivers (skip near-zero noise)
-        all_drivers = [
-            {
-                "feature": name.split("__")[-1],  # strip pipeline prefix
-                "impact": round(float(val), 4),
-                "value": features.get(name.split("__")[-1]),
-                "direction": "helps_score" if val > 0 else "hurts_score",
-            }
-            for name, val in zip(transformed_names, values)
-            if abs(val) > 0.001
-        ]
-
-        # helps: highest positive impact first (descending)
-        helps = sorted(
-            [d for d in all_drivers if d["direction"] == "helps_score"],
-            key=lambda x: x["impact"],
-            reverse=True,
-        )[:top_n]
-
-        # hurts: highest magnitude negative impact first
-        # (most damaging at top → least damaging at bottom)
-        hurts = sorted(
-            [d for d in all_drivers if d["direction"] == "hurts_score"],
-            key=lambda x: abs(x["impact"]),
-            reverse=True,
-        )[:top_n]
-
-        # Combined top drivers (sorted by absolute impact)
-        combined = sorted(
-            helps + hurts, key=lambda x: abs(x["impact"]), reverse=True
+        # Aggregate one-hot impacts back per original input column.
+        per_original = _map_transformed_to_original(
+            transformed_names, values, feature_names
         )
 
+        expected_value = explainer.expected_value
+        if isinstance(expected_value, (list, np.ndarray)):
+            base = float(np.asarray(expected_value).flatten()[0])
+        else:
+            base = float(expected_value)
+
+        top_helps, top_hurts = _split_helps_hurts(
+            per_original, features, top_n_helps, top_n_hurts
+        )
         return {
-            "top_drivers": combined,
-            "top_helps": helps,
-            "top_hurts": hurts,
-            "base_score": round(base_score, 2),
             "method": "shap",
+            "base_score": round(base, 2),
+            "top_helps": top_helps,
+            "top_hurts": top_hurts,
         }
 
     except Exception as e:
         logger.warning("SHAP failed, falling back to feature_importances_: %s", e)
-        return _fallback_importance(estimator, feature_names, top_n)
+        return _fallback_importance(
+            estimator, feature_names, features, top_n_helps, top_n_hurts
+        )
 
 
-def _fallback_importance(estimator, feature_names: list, top_n: int) -> dict:
-    """
-    Fallback when SHAP fails — uses sklearn's global feature_importances_.
-    Note: feature_importances_ are always positive (no direction).
-    """
+def _fallback_importance(
+    estimator, feature_names: list, features: dict,
+    top_n_helps: int = 7, top_n_hurts: int = 7,
+) -> dict:
+    """Fallback when SHAP fails. feature_importances_ is unsigned — all go to
+    top_helps (ranked by importance); top_hurts stays empty."""
     try:
         importances = estimator.feature_importances_
-        drivers = [
+        # If the importance vector is longer than the raw feature list (due to
+        # one-hot encoding inside the pipeline), align by truncation.
+        n = min(len(feature_names), len(importances))
+        ranked = sorted(
+            [(feature_names[i], float(importances[i])) for i in range(n)],
+            key=lambda x: x[1], reverse=True,
+        )
+        helps = [
             {
                 "feature": name,
-                "impact": round(float(imp), 4),
-                "value": None,
-                "direction": "helps_score",  # global importance has no direction
+                "impact": round(val, 4),
+                "value": features.get(name),
+                "direction": "helps_score",
             }
-            for name, imp in zip(feature_names, importances)
-            if imp > 0
+            for name, val in ranked[:top_n_helps]
         ]
-        drivers.sort(key=lambda x: x["impact"], reverse=True)
         return {
-            "top_drivers": drivers[: top_n * 2],
-            "top_helps": drivers[:top_n],
-            "top_hurts": [],
-            "base_score": None,
             "method": "feature_importance",
+            "base_score": None,
+            "top_helps": helps,
+            "top_hurts": [],
         }
     except Exception as e:
         logger.error("Fallback importance also failed: %s", e)
         return {
-            "top_drivers": [],
+            "method": "unavailable",
+            "base_score": None,
             "top_helps": [],
             "top_hurts": [],
-            "base_score": None,
-            "method": "unavailable",
         }
 
 
-def summarize_drivers(top_drivers: list) -> str:
-    if not top_drivers:
-        return "Explanation unavailable."
-    hurts = [d["feature"] for d in top_drivers if d["direction"] == "hurts_score"]
-    helps = [d["feature"] for d in top_drivers if d["direction"] == "helps_score"]
+def summarize_drivers(top_helps: list, top_hurts: list) -> str:
+    """Plain-English one-liner from the split driver lists."""
     parts = []
-    if hurts:
-        parts.append(f"Score reduced by: {', '.join(hurts[:7])}")
-    if helps:
-        parts.append(f"Score supported by: {', '.join(helps[:7])}")
-    return ". ".join(parts) + "." if parts else "No dominant drivers found."
+    if top_hurts:
+        parts.append(f"Score reduced by: {', '.join(d['feature'] for d in top_hurts[:2])}")
+    if top_helps:
+        parts.append(f"Score supported by: {', '.join(d['feature'] for d in top_helps[:2])}")
+    if not parts:
+        return "No dominant drivers found."
+    return ". ".join(parts) + "."

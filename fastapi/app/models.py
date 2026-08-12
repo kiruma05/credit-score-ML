@@ -107,6 +107,7 @@ class PredictionResponse(BaseModel):
     suggested_interest_rate: float
     validity_period: str
     model_version: str
+    data_quality: Optional[Dict[str, Any]] = None
 
 
 class DisburseRequest(BaseModel):
