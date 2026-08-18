@@ -1,6 +1,7 @@
 # IDE
 .idea/
 .claude/
+.github/
 
 # Python
 __pycache__/
@@ -13,6 +14,8 @@ dist/
 build/
 .venv/
 venv/
+.venv-test/
+.pytest_cache/
 
 # OS
 .DS_Store

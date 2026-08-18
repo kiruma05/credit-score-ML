@@ -14,6 +14,8 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier
 from sklearn.metrics import mean_squared_error, f1_score
 
+from leakage import feature_columns  # single source of truth for leakage exclusion
+
 
 def check_mlflow_connection(uri, timeout=20):
     """Checks if the MLflow tracking server is reachable before proceeding."""
@@ -57,7 +59,10 @@ def log_and_register_model(client, model, model_name, artifact_path, run_id):
         source=artifact_uri,
         run_id=run_id
     )
-    print(f"✅ Model version {new_version.version} created for '{model_name}'")
+    # Provenance: stamp the training run id on the version so any served
+    # prediction can be traced back to the exact artifact + data snapshot.
+    client.set_model_version_tag(model_name, new_version.version, "training_run_id", run_id)
+    print(f"✅ Model version {new_version.version} created for '{model_name}' (run {run_id})")
 
 
 def train():
@@ -75,17 +80,12 @@ def train():
     data_path = "/opt/airflow/data/customer_data.csv"
     df = pd.read_csv(data_path).fillna(0)
 
-    # Drop identifiers + targets + leakage helpers. payment_history_score is
+    # Select features via the shared leakage policy. payment_history_score is
     # the target of CreditScorePredictor (so it must NEVER be an input feature
-    # — was causing the model to just regurgitate the default value of 500).
-    # is_approved / is_fraud / is_high_risk are derived from the target too.
-    leakage_cols = [c for c in (
-        'customer_id', 'nida',
-        'risk_category_target',
-        'payment_history_score',
-        'is_approved', 'is_fraud', 'is_high_risk',
-    ) if c in df.columns]
-    X = df.drop(columns=leakage_cols)
+    # — was causing the model to just regurgitate the default value of 500);
+    # risk_category_target / is_approved / is_fraud / is_high_risk are targets or
+    # derived from them, and customer_id / nida are identifiers. See leakage.py.
+    X = df[feature_columns(df.columns.tolist())]
     y_score = df['payment_history_score']
     y_risk = df['risk_category_target']
     y_limit = df['monthly_income'] * 3

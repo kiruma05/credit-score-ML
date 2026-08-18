@@ -10,6 +10,8 @@ from pyspark.ml.classification import RandomForestClassifier  # Corrected import
 from pyspark.ml.evaluation import RegressionEvaluator, MulticlassClassificationEvaluator
 import mlflow
 import mlflow.spark
+
+from leakage import feature_columns  # single source of truth for leakage exclusion
 from mlflow.tracking import MlflowClient
 from urllib import request, error
 
@@ -52,7 +54,10 @@ def log_and_register_model(client, model, model_name, artifact_path, run_id):
         source=artifact_uri,
         run_id=run_id
     )
-    print(f"Successfully created model version {new_version.version} for '{model_name}'")
+    # Provenance: stamp the training run id on the version so any served
+    # prediction can be traced back to the exact artifact + data snapshot.
+    client.set_model_version_tag(model_name, new_version.version, "training_run_id", run_id)
+    print(f"Successfully created model version {new_version.version} for '{model_name}' (run {run_id})")
 
 
 def train():
@@ -75,9 +80,19 @@ def train():
     (train_data, test_data) = data.randomSplit([0.8, 0.2], seed=42)
 
     # --- Feature Engineering Pipeline Definitions ---
-    categorical_cols = [f.name for f in data.schema.fields if isinstance(f.dataType, T.StringType)]
-    categorical_cols = [c for c in categorical_cols if c not in ['customer_id', 'nida', 'risk_category_target']]
-    numerical_cols = [f.name for f in data.schema.fields if isinstance(f.dataType, (T.IntegerType, T.DoubleType))]
+    # Route ALL feature selection through the shared leakage policy. Previously
+    # numerical_cols was unfiltered, so payment_history_score (the score model's
+    # own label) leaked in as a feature — the pandas trainer excluded it but this
+    # one did not, despite both registering to the same MLflow model names.
+    safe_cols = set(feature_columns([f.name for f in data.schema.fields]))
+    categorical_cols = [
+        f.name for f in data.schema.fields
+        if isinstance(f.dataType, T.StringType) and f.name in safe_cols
+    ]
+    numerical_cols = [
+        f.name for f in data.schema.fields
+        if isinstance(f.dataType, (T.IntegerType, T.DoubleType)) and f.name in safe_cols
+    ]
 
     indexers = [StringIndexer(inputCol=col, outputCol=f"{col}_indexed", handleInvalid="keep") for col in
                 categorical_cols]

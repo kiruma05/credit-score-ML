@@ -1,6 +1,6 @@
 """Feature extraction for the credit scoring engine.
 
-Builds the 22 model features by joining across cms_uaa.user_accounts (NIDA →
+Builds the 21 model features by joining across cms_uaa.user_accounts (NIDA →
 uuid + demographics + income) and cms_origination (user_party_link → party_person
 → loan_application → employment_profile / applicant_asset / collateral_item /
 loan_purpose) and falls back to the rich ``loan_application.metadata`` JSONB
@@ -270,7 +270,7 @@ def _metadata_collateral_total(metadata: Any) -> float:
 
 
 def fetch_features(nida: str, uaa_db: Session, origination_db: Session) -> Tuple[dict, dict]:
-    """Build the 22-feature dict + data_quality report.
+    """Build the 21-feature dict + data_quality report.
 
     Never raises; returns quality flags so the caller decides whether to refuse
     (strict mode) or fall back (demo mode).

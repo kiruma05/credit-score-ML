@@ -334,7 +334,7 @@ def _seed_synthetic_features(features: dict, nida: str) -> None:
 
 
 def _get_customer_features(customer: models.Customer, uaa_db, origination_db):
-    """Resolve the 22 model features for a customer.
+    """Resolve the 21 model features for a customer.
 
     Thin wrapper over ``features.fetch_features``. Adds strict-mode rejection
     and the demo-mode seeded fallback that the new module deliberately does

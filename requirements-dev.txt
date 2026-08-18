@@ -1,0 +1,4 @@
+# Development / test dependencies (not needed at runtime).
+# Run: python3 -m venv .venv-test && .venv-test/bin/pip install -r requirements-dev.txt
+pytest>=8.0
+SQLAlchemy>=2.0
