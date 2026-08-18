@@ -1,0 +1,23 @@
+{
+  "model_id": "risk-category-predictor",
+  "model_name": "RiskCategoryPredictor",
+  "owner": "TBD — assign accountable model owner (default: Data Engineering, credit-scoring)",
+  "algorithm": "RandomForestClassifier (scikit-learn, n_estimators=100) / Spark RandomForestClassifier (numTrees=20)",
+  "training_period": "synthetic dataset, no calendar period (generate_dummy_data.py, seed=42)",
+  "training_data": "data/customer_data.csv (10,000 synthetic rows)",
+  "target": "risk_category_target (LOW / MEDIUM / HIGH)",
+  "target_type": "synthetic_formula",
+  "features": "21 (see governance/data_dictionary.json)",
+  "known_limitations": [
+    "Target is banded directly from the synthetic payment_history_score, so this model is largely redundant with CreditScorePredictor.",
+    "The rules layer also derives a risk band from the score, duplicating this output.",
+    "Reported F1 measures fit to a synthetic label, not real risk discrimination."
+  ],
+  "validation": {
+    "method": "random 80/20 holdout, stratified on risk (not out-of-time)",
+    "metric": "weighted F1",
+    "value": "not_recorded_here (logged to MLflow at each run)"
+  },
+  "approval_status": "NOT_APPROVED_FOR_PRODUCTION",
+  "notes": "Reference/demo model. Redundancy with the score model is a known architecture gap (Gap 6)."
+}

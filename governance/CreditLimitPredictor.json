@@ -1,0 +1,23 @@
+{
+  "model_id": "credit-limit-predictor",
+  "model_name": "CreditLimitPredictor",
+  "owner": "TBD — assign accountable model owner (default: Data Engineering, credit-scoring)",
+  "algorithm": "GradientBoostingRegressor (scikit-learn, n_estimators=100)",
+  "training_period": "synthetic dataset, no calendar period (generate_dummy_data.py, seed=42)",
+  "training_data": "data/customer_data.csv (10,000 synthetic rows)",
+  "target": "monthly_income * 3 (heuristic)",
+  "target_type": "synthetic_formula",
+  "features": "21 (see governance/data_dictionary.json)",
+  "known_limitations": [
+    "Target is a fixed 3x-income heuristic, not a modelled exposure or affordability limit.",
+    "The output is largely overridden by the business-rules tier limits (1.5x-5x income) and caps, so this model rarely determines the final limit (Gap 6).",
+    "No LGD/EAD/Expected-Loss modelling underpins the limit (Gap 8)."
+  ],
+  "validation": {
+    "method": "random 80/20 holdout (not out-of-time)",
+    "metric": "rmse",
+    "value": "not_recorded_here (logged to MLflow at each run)"
+  },
+  "approval_status": "NOT_APPROVED_FOR_PRODUCTION",
+  "notes": "Reference/demo model. Consider retiring or honouring its output rather than overriding it."
+}

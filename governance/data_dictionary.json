@@ -1,0 +1,27 @@
+{
+  "description": "Data dictionary for the credit scoring feature set. 'timing' classifies each feature as sample_point (known at application time — safe to use) or outcome_point (only known after the loan performs — would be leakage). All 21 current features are sample_point. Source is the primary origin; many fall back to loan_application.metadata (JSONB) when the relational column is null (see fastapi/app/features.py).",
+  "feature_count": 21,
+  "features": [
+    {"name": "age", "source": "cms_uaa.user_accounts.date_of_birth (derived years)", "dtype": "int", "description": "Applicant age in years.", "timing": "sample_point"},
+    {"name": "married", "source": "cms_origination.party_person.marital_status / loan_application.marital_status", "dtype": "categorical(YES/NO)", "description": "Marital status, normalised to YES/NO.", "timing": "sample_point", "fairness_flag": "possible protected/proxy attribute — pending Tanzania fair-lending review"},
+    {"name": "education", "source": "party_person.level_of_education / loan_application.education_level", "dtype": "categorical", "description": "Highest education level.", "timing": "sample_point", "fairness_flag": "possible proxy attribute — pending fair-lending review"},
+    {"name": "dependents", "source": "party_person.dependents / loan_application.number_of_dependents", "dtype": "int", "description": "Number of dependents.", "timing": "sample_point", "fairness_flag": "possible proxy attribute — pending fair-lending review"},
+    {"name": "employment_status", "source": "employment_profile.employment_type / metadata.employmentStatus", "dtype": "categorical", "description": "Employment type (EMPLOYED/SELF_EMPLOYED/etc.).", "timing": "sample_point"},
+    {"name": "spouse_employment_status", "source": "not sourced — always default NOT_APPLICABLE", "dtype": "categorical", "description": "FINDING: never populated from source; constant default. Effectively a dead feature.", "timing": "sample_point"},
+    {"name": "monthly_income", "source": "MAX(employment gross salary, 6-month income-history avg, metadata.monthlySalary, cms_uaa income)", "dtype": "float", "description": "Monthly income. FINDING: blind MAX across sources can be inflated by one bad value (Gap 4 / Phase 6).", "timing": "sample_point"},
+    {"name": "residense_status", "source": "party_person.house_status", "dtype": "categorical", "description": "Residence status (RENTED/OWNED/etc.).", "timing": "sample_point", "fairness_flag": "possible proxy attribute — pending fair-lending review"},
+    {"name": "vehicle_ownership_status", "source": "collateral_item / applicant_asset / metadata.assetsOwned", "dtype": "categorical(YES/NO)", "description": "Whether the applicant owns a vehicle.", "timing": "sample_point"},
+    {"name": "vehicle_cat", "source": "collateral_item.vehicle_class / asset description", "dtype": "categorical", "description": "Vehicle class/category if owned.", "timing": "sample_point"},
+    {"name": "credit_history_length_months", "source": "employment_profile.duration_years * 12 / metadata.yearsInEmployment", "dtype": "int", "description": "FINDING: labelled 'credit history' but actually derived from EMPLOYMENT duration — a mislabel/proxy, not true credit history.", "timing": "sample_point"},
+    {"name": "total_outstanding_debt", "source": "sum(requested_amount) of active (non-rejected, non-draft) applications", "dtype": "float", "description": "Aggregate outstanding debt across active applications.", "timing": "sample_point"},
+    {"name": "credit_utilization_ratio", "source": "derived: min(1, debt / savings_account_balance)", "dtype": "float", "description": "Credit utilisation ratio.", "timing": "sample_point"},
+    {"name": "number_of_late_payments_36", "source": "not sourced — always default 0", "dtype": "int", "description": "FINDING: never populated from source; constant 0. Effectively a dead feature (no real delinquency history available).", "timing": "sample_point"},
+    {"name": "active_loans", "source": "count of active applications (+1 if party_person.has_other_loan)", "dtype": "int", "description": "Number of active loans/applications.", "timing": "sample_point"},
+    {"name": "avg_monthly_balance", "source": "MAX(net salary, income-history avg, gross salary)", "dtype": "float", "description": "Proxy for average monthly balance.", "timing": "sample_point"},
+    {"name": "savings_account_balance", "source": "cms_uaa.user_accounts.credit_limit / metadata.totalAssetsValue", "dtype": "float", "description": "Savings/liquid balance proxy.", "timing": "sample_point"},
+    {"name": "requested_amount", "source": "loan_application.requested_amount", "dtype": "float", "description": "Requested loan amount (latest qualifying application).", "timing": "sample_point"},
+    {"name": "loan_purpose", "source": "loan_purpose.purpose_text / loan_application.loan_purpose", "dtype": "categorical", "description": "Purpose of the requested loan.", "timing": "sample_point"},
+    {"name": "previous_collateral_value", "source": "collateral_item.estimated_value / metadata.collaterals", "dtype": "float", "description": "Total value of collateral on qualifying applications.", "timing": "sample_point"},
+    {"name": "debt_to_income_ratio", "source": "derived: debt / (monthly_income * 12)", "dtype": "float", "description": "Debt-to-income ratio (drives the DTI guard rail).", "timing": "sample_point"}
+  ]
+}

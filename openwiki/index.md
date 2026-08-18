@@ -38,8 +38,9 @@ Airflow/Spark training stack, and PostgreSQL + MinIO for storage.
 - [Fraud Detection](fraud-detection.md) — the fraud model, loading strategy, and endpoint.
 - [Data Model](data-model.md) — PostgreSQL tables, API schemas, and the external DBs.
 - [Authentication](authentication.md) — API key/secret model and dev/prod toggles.
-- [ML Pipeline (MLflow · Airflow · Spark)](ml-pipeline.md) — training, retraining, and serving.
-- [Deployment & Configuration](deployment.md) — docker-compose, environment, and CI/CD.
+- [ML Pipeline (MLflow · Airflow · Spark)](ml-pipeline.md) — training, retraining, serving, and PSI monitoring. (alias: [Training & Registry](training-and-registry.md))
+- [Deployment & Configuration](deployment.md) — docker-compose, environment, and CI/CD. (alias: [Runtime Topology](runtime.md))
+- **Governance:** per-model records + feature data dictionary live in `governance/` (see `governance/README.md`).
 
 > This wiki was authored by reading the source directly. Files are cited by path
 > so you can jump straight to the code.

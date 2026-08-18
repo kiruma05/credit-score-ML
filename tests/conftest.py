@@ -11,7 +11,9 @@ import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-for rel in ("fastapi/app", "airflow/jobs"):
+# Repo root first so `import governance.schema` (a repo-root package) resolves,
+# then the pure module dirs.
+for rel in (".", "fastapi/app", "airflow/jobs"):
     path = os.path.join(REPO_ROOT, rel)
     if path not in sys.path:
         sys.path.insert(0, path)

@@ -1,0 +1,24 @@
+{
+  "model_id": "credit-score-predictor",
+  "model_name": "CreditScorePredictor",
+  "owner": "TBD — assign accountable model owner (default: Data Engineering, credit-scoring)",
+  "algorithm": "GradientBoostingRegressor (scikit-learn, n_estimators=100) / GBTRegressor (Spark, maxIter=10)",
+  "training_period": "synthetic dataset, no calendar period (generate_dummy_data.py, seed=42)",
+  "training_data": "data/customer_data.csv (10,000 synthetic rows)",
+  "target": "payment_history_score (300-850)",
+  "target_type": "synthetic_formula",
+  "features": "21 (see governance/data_dictionary.json)",
+  "known_limitations": [
+    "Target is a hand-written formula plus noise, not observed repayment behaviour; the model learns to approximate a scorecard, not real default risk.",
+    "Reported RMSE measures fit to the synthetic formula, not real-world predictive power.",
+    "Score is an arbitrary regression target, not a calibrated probability of default (no PD).",
+    "risk_probability / interest_rate downstream are currently random within a tier (see services.py)."
+  ],
+  "validation": {
+    "method": "random 80/20 holdout (not out-of-time)",
+    "metric": "rmse",
+    "value": "not_recorded_here (logged to MLflow at each run)"
+  },
+  "approval_status": "NOT_APPROVED_FOR_PRODUCTION",
+  "notes": "Reference/demo model. Production use is gated on Track 2 (real repayment data)."
+}
