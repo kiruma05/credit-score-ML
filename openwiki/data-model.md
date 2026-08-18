@@ -49,6 +49,16 @@ to one `customer` and optionally one `loan`.
 `is_active`, `expires_at` (null = never expires), `created_at`, `last_used_at`,
 `scopes` (reserved). Backs [Authentication](authentication.md).
 
+### `overrides`
+Audit log of every guard-rail trigger that **materially changed** a decision
+(added in Phase 2 of the remediation plan). Written from
+`services.build_override_event`: `customer_id`, `loan_ref`, `rule_name`
+(`HIGH_DTI` / `OVER_LEVERAGE` / `SUBSISTENCE_INCOME_CAP`),
+`pre_override_decision`, `post_override_decision`, `pre_override_score`,
+`pre_override_limit`, `post_override_limit`, `actor` (system/human),
+`model_version`, `training_run_id`, `created_at`. Makes guard-rail behavior
+queryable for model-risk review.
+
 ```mermaid
 erDiagram
     customers ||--o{ cached_inferences : has

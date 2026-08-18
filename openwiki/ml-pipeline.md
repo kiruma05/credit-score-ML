@@ -45,6 +45,18 @@ MinIO through `MLFLOW_S3_ENDPOINT_URL=http://minio:9000`.
 | `model_retraining_with_spark_operator` | `retraining_dag.py` | manual (`None`) | `SparkSubmitOperator` → `spark_train_submit_task` |
 | `mlflow_infrastructure_smoke_test` | `smoke_test_dag.py` | manual (`None`) | `SparkSubmitOperator` → MLflow connectivity test |
 | `sparking_flow` | `spark_submit_dag.py` | `@daily` | `SparkSubmitOperator` → `python_job` |
+| `psi_monitoring` | `psi_monitoring_dag.py` | `@daily` | `PythonOperator` → PSI drift check (alerts if PSI > 0.25) |
+
+### Monitoring: Population Stability Index (PSI)
+
+`psi_monitoring_dag` compares the **current scoring population's** score
+distribution against the **training baseline** (`customer_data.csv`) each day and
+**fails the task (alerts) when PSI > 0.25** — the standard "significant shift"
+threshold. The maths live in the unit-tested `airflow/jobs/psi.py`; the IO
+(baseline from CSV, current scores from `cached_inferences`) lives in
+`airflow/jobs/psi_monitoring.py` and skips gracefully when there is no scoring
+traffic yet. This addresses the "no monitoring/backtesting" weakness — see
+[Model Risk & Weaknesses](model-risk-and-weaknesses.md).
 
 Most training DAGs are **manual-trigger** (`schedule_interval=None`); only
 `sparking_flow` is scheduled daily. Spark DAGs submit to `spark-master`

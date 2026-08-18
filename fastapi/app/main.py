@@ -390,17 +390,21 @@ def _build_credit_inference(features: dict) -> dict:
     raw_limit = _invoke_mlflow_server(CREDIT_LIMIT_URI, features)
 
     credit_score = float(raw_score) if raw_score is not None else float(random.randint(300, 850))
-    decision, risk_category, risk_probability, limit_usd, interest_rate, validity_days = \
-        services.apply_business_rules(credit_score, monthly_income, dti, active_loans)
+    evaluation = services.evaluate_credit_decision(
+        credit_score, monthly_income, dti, active_loans
+    )
 
     return {
         "credit_score": credit_score,
-        "risk_category": str(raw_risk) if raw_risk is not None else risk_category,
-        "risk_probability": risk_probability,
-        "decision": decision,
-        "recommended_credit_limit": float(raw_limit) if raw_limit is not None else limit_usd,
-        "suggested_interest_rate": interest_rate,
-        "validity_period_days": validity_days,
+        "risk_category": str(raw_risk) if raw_risk is not None else evaluation["risk_category"],
+        "risk_probability": evaluation["risk_probability"],
+        "decision": evaluation["decision"],
+        "recommended_credit_limit": float(raw_limit) if raw_limit is not None else evaluation["limit"],
+        "suggested_interest_rate": evaluation["interest_rate"],
+        "validity_period_days": evaluation["validity_period_days"],
+        # Internal: structured evaluation for guard-rail override logging. Popped
+        # by the caller before the dict is used to build the cache/response.
+        "_evaluation": evaluation,
     }
 
 
@@ -604,6 +608,35 @@ def predict(
         model_version = get_production_model_version("CreditScorePredictor")
         inference["model_version"] = model_version
 
+        # Audit every guard-rail override as a queryable event (best-effort —
+        # never block or fail a lending decision because logging failed).
+        evaluation = inference.pop("_evaluation", None)
+        if evaluation is not None:
+            override_event = services.build_override_event(
+                evaluation, customer_id=customer.customer_id
+            )
+            if override_event is not None:
+                try:
+                    local_db.add(models.Override(
+                        customer_id=override_event["customer_id"],
+                        loan_ref=override_event["loan_ref"],
+                        rule_name=override_event["rule_name"],
+                        pre_override_decision=override_event["pre_override_decision"],
+                        post_override_decision=override_event["post_override_decision"],
+                        pre_override_score=override_event["pre_override_score"],
+                        pre_override_limit=override_event["pre_override_limit"],
+                        post_override_limit=override_event["post_override_limit"],
+                        actor=override_event["actor"],
+                        model_version=model_version,
+                    ))
+                    local_db.commit()
+                    print(f"[OVERRIDE] {override_event['rule_name']} for "
+                          f"{customer.customer_id}: {override_event['pre_override_decision']}"
+                          f"→{override_event['post_override_decision']}")
+                except Exception as exc:
+                    local_db.rollback()
+                    print(f"[WARN] Failed to log override event: {exc}", file=sys.stderr)
+
         # Only cache scores grounded in live data — fallback scores must re-run
         # on every call so the moment real cms_uaa data lands, scoring refreshes.
         if data_quality["score_basis"] == "live_data":
@@ -681,6 +714,7 @@ def explain(
     customer = find_or_create_customer(request.nida, local_db, ext_db)
     features, data_quality = _get_customer_features(customer, ext_db, origination_db)
     inference = _build_credit_inference(features)
+    inference.pop("_evaluation", None)  # read-only what-if: don't log overrides here
     model_version = get_production_model_version("CreditScorePredictor")
 
     # Load model from MLflow registry for SHAP (bypasses serving endpoint)

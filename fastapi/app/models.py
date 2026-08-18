@@ -84,6 +84,29 @@ class ApiClient(Base):
     scopes = Column(String, default="*")               # reserved for future scope-based auth
 
 
+class Override(Base):
+    """Audit log of every guard-rail trigger that materially changed a decision.
+
+    Written whenever a business rule overrode the model's score-tier outcome, so
+    overrides are queryable for model-risk review (which rule fires, how often,
+    on whom). Populated from ``services.build_override_event``.
+    """
+    __tablename__ = "overrides"
+    id = Column(Integer, primary_key=True)
+    customer_id = Column(String, index=True, nullable=False)
+    loan_ref = Column(String, index=True, nullable=True)
+    rule_name = Column(String, index=True, nullable=False)     # e.g. HIGH_DTI
+    pre_override_decision = Column(String, nullable=False)
+    post_override_decision = Column(String, nullable=False)
+    pre_override_score = Column(Float, nullable=True)
+    pre_override_limit = Column(Numeric(12, 2), nullable=True)
+    post_override_limit = Column(Numeric(12, 2), nullable=True)
+    actor = Column(String, default="system", nullable=False)   # system | human
+    model_version = Column(String, nullable=True)
+    training_run_id = Column(String, nullable=True)            # provenance link
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 # ==============================================================================
 # --- Pydantic API Models (How data looks in API requests/responses) ---
 # ==============================================================================
