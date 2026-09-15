@@ -6,21 +6,13 @@ LABEL authors="kiruma"
 USER root
 
 # --- INSTRUCTION 1: Fetch the Hadoop-AWS / S3A jars ---
-# Download with a tool already present in the base image (curl) instead of
-# apt-installing wget. This avoids a hard dependency on the Debian bullseye
-# security pool, which intermittently 404s specific point-release .debs when
-# the CDN index is out of sync with the pool.
-RUN set -eux; \
-    JARDIR="${SPARK_HOME}/jars"; \
-    HADOOP_AWS="https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.2/hadoop-aws-3.3.2.jar"; \
-    AWS_SDK="https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.367/aws-java-sdk-bundle-1.12.367.jar"; \
-    if command -v curl >/dev/null 2>&1; then \
-        curl -fSL "$HADOOP_AWS" -o "$JARDIR/hadoop-aws-3.3.2.jar"; \
-        curl -fSL "$AWS_SDK"    -o "$JARDIR/aws-java-sdk-bundle-1.12.367.jar"; \
-    else \
-        wget -q "$HADOOP_AWS" -P "$JARDIR/"; \
-        wget -q "$AWS_SDK"    -P "$JARDIR/"; \
-    fi
+# The bitnami base image ships without wget or curl, and the Debian bullseye
+# security pool intermittently 404s, so we avoid needing a downloader at all:
+# Docker's native remote ADD lets BuildKit fetch the jars with its own HTTP
+# client (no apt/wget/curl). --chmod=644 makes them world-readable so the
+# non-root spark user (uid 1001) can load them onto the classpath.
+ADD --chmod=644 https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.2/hadoop-aws-3.3.2.jar /opt/bitnami/spark/jars/
+ADD --chmod=644 https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.367/aws-java-sdk-bundle-1.12.367.jar /opt/bitnami/spark/jars/
 
 # --- INSTRUCTION 2: Install Python's package manager ---
 # Retry once on a transient mirror/CDN failure before giving up.
