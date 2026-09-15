@@ -14,14 +14,13 @@ USER root
 ADD --chmod=644 https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.2/hadoop-aws-3.3.2.jar /opt/bitnami/spark/jars/
 ADD --chmod=644 https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.367/aws-java-sdk-bundle-1.12.367.jar /opt/bitnami/spark/jars/
 
-# --- INSTRUCTION 2: Install Python's package manager ---
-# Retry once on a transient mirror/CDN failure before giving up.
-RUN (apt-get update && apt-get install -y --no-install-recommends python3-pip) || \
-    (sleep 5 && apt-get update && apt-get install -y --no-install-recommends --fix-missing python3-pip); \
-    rm -rf /var/lib/apt/lists/*
-
-# --- INSTRUCTION 3: Install Python libraries ---
-RUN pip install \
+# --- INSTRUCTION 2: Install Python libraries ---
+# The bitnami base already bundles Python 3.10 + pip at /opt/bitnami/python
+# (first on PATH and the interpreter Spark runs), so there is no need to
+# apt-install python3-pip — which also removes the last dependency on the
+# flaky Debian bullseye mirror. Pin the explicit pip path so packages always
+# land in the interpreter Spark actually uses.
+RUN /opt/bitnami/python/bin/pip install \
     mlflow==2.7.1 \
     boto3 \
     pyspark==3.3.3 \
