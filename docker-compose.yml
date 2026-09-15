@@ -305,6 +305,11 @@ services:
       - FRAUD_MODEL_NAME=FraudDetector
       - FRAUD_MODEL_VERSION=1
       - ENCODER_PATH=/opt/airflow/data/label_encoders.pkl
+      # Demo mode: score every NIDA even when no live customer data exists,
+      # falling back to seeded synthetic features (data_quality.score_basis
+      # reports how real the answer is). Set to "true" before production so
+      # unknown NIDAs are refused instead of scored on dummy data.
+      - SCORING_STRICT_MODE=false
     ports:
       - "18008:8000"
     volumes:
